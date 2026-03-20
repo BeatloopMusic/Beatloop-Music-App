@@ -1,0 +1,2935 @@
+package com.beatloop.music.data.repository
+
+import android.util.Log
+import com.beatloop.music.data.api.InnerTubeApi
+import com.beatloop.music.data.api.ReturnYouTubeDislikeApi
+import com.beatloop.music.data.database.ArtistPlayStat
+import com.beatloop.music.data.database.DownloadedSongDao
+import com.beatloop.music.data.database.SongDao
+import com.beatloop.music.data.database.SearchHistoryDao
+import com.beatloop.music.data.database.SearchHistory
+import com.beatloop.music.data.model.*
+import com.beatloop.music.data.preferences.PreferencesManager
+import com.google.gson.Gson
+import com.google.gson.JsonArray
+import com.google.gson.JsonObject
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import okhttp3.RequestBody.Companion.toRequestBody
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+import java.io.File
+import java.io.IOException
+import java.net.URLDecoder
+import java.net.URLEncoder
+import java.util.UUID
+import java.util.concurrent.TimeUnit
+import javax.inject.Inject
+import javax.inject.Singleton
+import kotlin.random.Random
+import org.schabi.newpipe.extractor.NewPipe
+import org.schabi.newpipe.extractor.ServiceList
+import org.schabi.newpipe.extractor.downloader.Downloader
+import org.schabi.newpipe.extractor.downloader.Request
+import org.schabi.newpipe.extractor.downloader.Response
+import org.schabi.newpipe.extractor.exceptions.ReCaptchaException
+import org.schabi.newpipe.extractor.stream.AudioStream
+import org.schabi.newpipe.extractor.stream.StreamInfo
+
+@Singleton
+class MusicRepository @Inject constructor(
+    private val innerTubeApi: InnerTubeApi,
+    private val returnYouTubeDislikeApi: ReturnYouTubeDislikeApi,
+    private val songDao: SongDao,
+    private val searchHistoryDao: SearchHistoryDao,
+    private val downloadedSongDao: DownloadedSongDao,
+    private val preferencesManager: PreferencesManager
+) {
+    private data class OnboardingSeedCache(
+        val key: String,
+        val songs: List<SongItem>,
+        val timestampMs: Long
+    )
+
+    private var onboardingSeedCache: OnboardingSeedCache? = null
+
+    private val pipedApiInstances = listOf(
+        "https://pipedapi.kavin.rocks",
+        "https://pipedapi.adminforge.de",
+        "https://pipedapi.leptons.xyz",
+        "https://pipedapi.nosebs.ru",
+        "https://piped-api.codespace.cz",
+        "https://api.piped.private.coffee",
+        "https://pipedapi.orangenet.cc",
+        "https://pipedapi.syncpundit.io"
+    )
+
+    private val invidiousApiInstances = listOf(
+        "https://inv.nadeko.net",
+        "https://vid.puffyan.us",
+        "https://invidious.private.coffee",
+        "https://invidious.privacyredirect.com"
+    )
+
+    private val pipedStreamEndpointTemplates = listOf(
+        "/streams/%s",
+        "/api/v1/streams/%s",
+        "/api/streams/%s"
+    )
+
+    @Volatile
+    private var pipedInstancesCache: Pair<List<String>, Long>? = null
+
+    private enum class SignatureOperationType {
+        REVERSE,
+        SLICE,
+        SWAP
+    }
+
+    private data class SignatureOperation(
+        val type: SignatureOperationType,
+        val argument: Int = 0
+    )
+
+    private data class SignatureDecipherPlan(
+        val playerScriptUrl: String,
+        val operations: List<SignatureOperation>
+    )
+
+    @Volatile
+    private var signatureDecipherPlanCache: SignatureDecipherPlan? = null
+
+    private val extractorHttpClient: okhttp3.OkHttpClient by lazy {
+        okhttp3.OkHttpClient.Builder()
+            .connectTimeout(10, TimeUnit.SECONDS)
+            .readTimeout(15, TimeUnit.SECONDS)
+            .followRedirects(true)
+            .followSslRedirects(true)
+            .build()
+    }
+
+    private val languageSearchHints: Map<String, List<String>> = mapOf(
+        "hindi" to listOf("hindi songs", "bollywood hits"),
+        "tamil" to listOf("tamil songs", "kollywood hits"),
+        "telugu" to listOf("telugu songs", "tollywood hits"),
+        "malayalam" to listOf("malayalam songs"),
+        "kannada" to listOf("kannada songs"),
+        "punjabi" to listOf("punjabi songs"),
+        "english" to listOf("english pop songs"),
+        "spanish" to listOf("spanish songs"),
+        "arabic" to listOf("arabic songs"),
+        "japanese" to listOf("japanese songs", "j-pop songs"),
+        "korean" to listOf("korean songs", "k-pop songs")
+    )
+
+    companion object {
+        private const val TAG = "MusicRepository"
+        private const val PIPED_INSTANCE_LIST_URL = "https://raw.githubusercontent.com/TeamPiped/documentation/main/content/docs/public-instances/index.md"
+        private const val PIPED_INSTANCE_CACHE_TTL_MS = 30 * 60 * 1000L
+        private const val STRATEGY_TIMEOUT_MS = 10_000L
+        private const val STRATEGY_TIMEOUT_SLOW_MS = 15_000L
+        private val newPipeInitLock = Any()
+
+        @Volatile
+        private var newPipeInitialized = false
+
+        // Generate a consistent visitor ID for the session
+        private val visitorData = generateVisitorData()
+        
+        private fun generateVisitorData(): String {
+            // Generate a visitor data string similar to what YouTube uses
+            val timestamp = System.currentTimeMillis() / 1000
+            return "CgtBWWR3${UUID.randomUUID().toString().take(8)}${timestamp % 1000000}"
+        }
+    }
+    
+    // WEB_REMIX context for browse/search (YouTube Music web client)
+    private fun createWebContext(): JsonObject {
+        return JsonObject().apply {
+            add("client", JsonObject().apply {
+                addProperty("clientName", "WEB_REMIX")
+                addProperty("clientVersion", "1.20231204.01.00")
+                addProperty("hl", "en")
+                addProperty("gl", "US")
+                addProperty("visitorData", visitorData)
+                addProperty("userAgent", InnerTubeApi.WEB_USER_AGENT)
+                addProperty("originalUrl", "https://music.youtube.com/")
+                addProperty("platform", "DESKTOP")
+            })
+        }
+    }
+    
+    // ANDROID_MUSIC client context for player requests (streaming)
+    private fun createAndroidContext(): JsonObject {
+        return JsonObject().apply {
+            add("client", JsonObject().apply {
+                addProperty("clientName", "ANDROID_MUSIC")
+                addProperty("clientVersion", "5.01")
+                addProperty("androidSdkVersion", 30)
+                addProperty("hl", "en")
+                addProperty("gl", "US")
+                addProperty("visitorData", visitorData)
+            })
+        }
+    }
+
+    // ANDROID_VR client context inspired by OuterTune stream fallback matrix.
+    private fun createAndroidVrContext(): JsonObject {
+        return JsonObject().apply {
+            add("client", JsonObject().apply {
+                addProperty("clientName", "ANDROID_VR")
+                addProperty("clientVersion", "1.61.48")
+                addProperty("androidSdkVersion", 32)
+                addProperty("hl", "en")
+                addProperty("gl", "US")
+                addProperty("visitorData", visitorData)
+            })
+        }
+    }
+
+    // Generic ANDROID client context used as a secondary stream source.
+    private fun createAndroidClientContext(): JsonObject {
+        return JsonObject().apply {
+            add("client", JsonObject().apply {
+                addProperty("clientName", "ANDROID")
+                addProperty("clientVersion", "20.10.38")
+                addProperty("androidSdkVersion", 30)
+                addProperty("hl", "en")
+                addProperty("gl", "US")
+                addProperty("visitorData", visitorData)
+            })
+        }
+    }
+
+    // WEB_CREATOR context (OuterTune uses a broader web-client matrix).
+    private fun createWebCreatorContext(): JsonObject {
+        return JsonObject().apply {
+            add("client", JsonObject().apply {
+                addProperty("clientName", "WEB_CREATOR")
+                addProperty("clientVersion", "1.20250312.03.01")
+                addProperty("hl", "en")
+                addProperty("gl", "US")
+                addProperty("visitorData", visitorData)
+                addProperty("userAgent", InnerTubeApi.WEB_USER_AGENT)
+                addProperty("platform", "DESKTOP")
+            })
+        }
+    }
+    
+    // iOS client context - often works better for streaming
+    private fun createiOSContext(): JsonObject {
+        return JsonObject().apply {
+            add("client", JsonObject().apply {
+                addProperty("clientName", "IOS")
+                addProperty("clientVersion", "19.29.1")
+                addProperty("deviceMake", "Apple")
+                addProperty("deviceModel", "iPhone16,2")
+                addProperty("hl", "en")
+                addProperty("gl", "US")
+                addProperty("osName", "iPhone")
+                addProperty("osVersion", "17.5.1.21F90")
+                addProperty("visitorData", visitorData)
+            })
+        }
+    }
+    
+    // TVHTML5 client context - used as fallback for age-restricted content
+    private fun createTVContext(): JsonObject {
+        return JsonObject().apply {
+            add("client", JsonObject().apply {
+                addProperty("clientName", "TVHTML5_SIMPLY_EMBEDDED_PLAYER")
+                addProperty("clientVersion", "2.0")
+                addProperty("hl", "en")
+                addProperty("gl", "US")
+                addProperty("visitorData", visitorData)
+            })
+        }
+    }
+    
+    // Legacy method for backward compatibility
+    private fun createContext(): JsonObject = createWebContext()
+    
+    suspend fun search(query: String, filter: SearchFilter = SearchFilter.All): Result<SearchResult> = withContext(Dispatchers.IO) {
+        try {
+            Log.d(TAG, "Searching for: $query")
+            val body = JsonObject().apply {
+                addProperty("query", query)
+                add("context", createWebContext())
+            }
+            
+            val response = innerTubeApi.search(body)
+            Log.d(TAG, "Search response received, parsing...")
+            val result = parseSearchResult(response, filter)
+            Log.d(TAG, "Search parsed: ${result.songs.size} songs, ${result.artists.size} artists, ${result.albums.size} albums")
+            
+            // Save to search history
+            searchHistoryDao.insert(SearchHistory(query))
+            
+            Result.success(result)
+        } catch (e: Exception) {
+            Log.e(TAG, "Search failed", e)
+            Result.failure(e)
+        }
+    }
+    
+    suspend fun getSearchSuggestions(query: String): Result<List<String>> = withContext(Dispatchers.IO) {
+        try {
+            Log.d(TAG, "Getting search suggestions for: $query")
+            val body = JsonObject().apply {
+                addProperty("input", query)
+                add("context", createWebContext())
+            }
+            
+            val response = innerTubeApi.getSearchSuggestions(body)
+            val suggestions = parseSearchSuggestions(response)
+            Log.d(TAG, "Got ${suggestions.size} suggestions")
+            Result.success(suggestions)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to get search suggestions", e)
+            Result.failure(e)
+        }
+    }
+    
+    suspend fun getHome(refreshNonce: Long = System.currentTimeMillis()): Result<HomeContent> = withContext(Dispatchers.IO) {
+        try {
+            Log.d(TAG, "Loading home content...")
+            val body = JsonObject().apply {
+                addProperty("browseId", "FEmusic_home")
+                add("context", createWebContext())
+            }
+            
+            val response = innerTubeApi.browse(body)
+            Log.d(TAG, "Home response received, parsing...")
+            val baseHomeContent = parseHomeContent(response)
+            val homeContent = personalizeHomeContent(baseHomeContent, refreshNonce)
+            Log.d(TAG, "Home parsed: ${homeContent.quickPicks.size} quick picks, ${homeContent.trendingSongs.size} trending, ${homeContent.newReleases.size} new releases")
+            Result.success(homeContent)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to load home content", e)
+            Result.failure(e)
+        }
+    }
+
+    suspend fun getVideoVotes(videoId: String): Result<VideoVotes> = withContext(Dispatchers.IO) {
+        try {
+            if (videoId.isBlank()) {
+                return@withContext Result.failure(IllegalArgumentException("videoId is blank"))
+            }
+
+            val response = returnYouTubeDislikeApi.getVotes(videoId)
+            val votes = VideoVotes(
+                videoId = response.id.ifBlank { videoId },
+                likes = response.likes ?: 0L,
+                dislikes = response.dislikes ?: 0L,
+                viewCount = response.viewCount ?: 0L,
+                rating = response.rating
+            )
+            Result.success(votes)
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to load ReturnYouTubeDislike votes for $videoId: ${e.message}")
+            Result.failure(e)
+        }
+    }
+
+    private suspend fun personalizeHomeContent(base: HomeContent, refreshNonce: Long): HomeContent {
+        return try {
+            val seedSongs = songDao.getPersonalizationSeedSongs(limit = 150)
+            val recentSongs = songDao.getRecentlyPlayedSongItems(limit = 30)
+            val topArtistStats = songDao.getTopArtistPlayStats(limit = 30)
+            val preferenceProfile = getPreferenceProfile()
+            val onboardingSeedSongs = getOnboardingSeedSongs(preferenceProfile)
+            val onboardingSeedSongIds = onboardingSeedSongs.map { it.id }.toSet()
+            val languageTokens = preferenceProfile.languages.flatMap { language ->
+                languageSearchHints[language.lowercase()] ?: listOf(language)
+            }.map { it.lowercase() }
+
+            val topArtists = buildTopArtists(seedSongs, topArtistStats)
+            val weightedArtists: List<String> = (topArtists + preferenceProfile.singers)
+                .distinct()
+                .take(8)
+            val topArtistWeight = weightedArtists
+                .mapIndexed { index, artist -> artist to (40 - index * 6).coerceAtLeast(8) }
+                .toMap()
+
+            val seedById = seedSongs.associateBy { it.id }
+            val candidateSongs = (
+                base.quickPicks +
+                    base.trendingSongs +
+                    recentSongs +
+                    seedSongs.map { it.toSongItem() } +
+                    onboardingSeedSongs
+                )
+                .distinctBy { it.id }
+
+            val personalized = candidateSongs
+                .sortedByDescending { candidate ->
+                    val seed = seedById[candidate.id]
+                    val candidateText = "${candidate.title} ${candidate.artistsText}".lowercase()
+                    val artistScore = splitArtists(candidate.artistsText)
+                        .maxOfOrNull { artist -> topArtistWeight[artist] ?: 0 }
+                        ?: 0
+                    val playScore = (seed?.playCount ?: 0) * 4
+                    val likeScore = if (seed?.liked == true) 20 else 0
+                    val recentScore = if (seed?.lastPlayedAt != null) {
+                        val ageHours = ((System.currentTimeMillis() - seed.lastPlayedAt) / (1000 * 60 * 60)).coerceAtLeast(0)
+                        (24 - ageHours.toInt()).coerceAtLeast(0)
+                    } else {
+                        0
+                    }
+                    val singerPreferenceScore = preferenceProfile.singers.fold(0) { acc, singer ->
+                        acc + if (candidate.artistsText.contains(singer, ignoreCase = true)) 24 else 0
+                    }
+                    val creatorHintText = "${candidate.title} ${candidate.artistsText}"
+                    val lyricistPreferenceScore = preferenceProfile.lyricists.fold(0) { acc, lyricist ->
+                        acc + if (creatorHintText.contains(lyricist, ignoreCase = true)) 14 else 0
+                    }
+                    val directorPreferenceScore = preferenceProfile.musicDirectors.fold(0) { acc, director ->
+                        acc + if (creatorHintText.contains(director, ignoreCase = true)) 14 else 0
+                    }
+                    val languagePreferenceScore = languageTokens.fold(0) { acc, token ->
+                        acc + if (candidateText.contains(token)) 10 else 0
+                    }
+                    val onboardingSeedBoost = if (onboardingSeedSongIds.contains(candidate.id)) 30 else 0
+                    val baseFeedBoost = if (base.quickPicks.any { it.id == candidate.id }) 8 else 0
+                    val personalizationScore = artistScore + playScore + likeScore + recentScore + singerPreferenceScore +
+                        lyricistPreferenceScore + directorPreferenceScore + languagePreferenceScore +
+                        onboardingSeedBoost + baseFeedBoost
+                    personalizationScore
+                }
+                .take(30)
+
+            val motivationMessage = when {
+                onboardingSeedSongs.isNotEmpty() && preferenceProfile.singers.isNotEmpty() ->
+                    "Recommendations tuned for ${preferenceProfile.singers.first()} and your selected vibe"
+                personalized.isNotEmpty() && weightedArtists.isNotEmpty() ->
+                    "Fresh picks based on your ${weightedArtists.first()} listening taste"
+                recentSongs.isNotEmpty() -> "Welcome back. Your recent vibe is ready."
+                preferenceProfile.languages.isNotEmpty() ->
+                    "Handpicked recommendations for ${preferenceProfile.languages.take(2).joinToString(", ")}"
+                else -> "Start listening to unlock a personalized feed."
+            }
+
+            val personalizedPool = personalized.ifEmpty {
+                onboardingSeedSongs.take(30).ifEmpty { base.trendingSongs.take(30) }
+            }
+
+            val diversifiedPool = diversifyRecommendations(
+                candidates = personalizedPool,
+                recentlyPlayedIds = recentSongs.map { it.id }.toSet(),
+                refreshNonce = refreshNonce
+            )
+
+            val fallbackQuickPicks = (onboardingSeedSongs + base.quickPicks)
+                .distinctBy { it.id }
+                .take(15)
+
+            base.copy(
+                motivationMessage = motivationMessage,
+                quickPicks = diversifiedPool.take(15).ifEmpty { fallbackQuickPicks.ifEmpty { base.quickPicks } },
+                personalizedRecommendations = diversifiedPool.ifEmpty { personalizedPool },
+                recentlyPlayed = recentSongs.ifEmpty { base.recentlyPlayed },
+                topArtists = weightedArtists.take(5).ifEmpty { preferenceProfile.singers.take(5) }
+            )
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to personalize home content: ${e.message}")
+            base
+        }
+    }
+
+    private suspend fun getPreferenceProfile(): PreferenceProfile {
+        val onboardingCompleted = preferencesManager.onboardingCompleted.first()
+        if (!onboardingCompleted) {
+            return PreferenceProfile()
+        }
+
+        return PreferenceProfile(
+            languages = preferencesManager.preferredLanguages.first().filterNot { it.equals("None", ignoreCase = true) }.toSet(),
+            singers = preferencesManager.preferredSingers.first().filterNot { it.equals("None", ignoreCase = true) }.toSet(),
+            lyricists = preferencesManager.preferredLyricists.first().filterNot { it.equals("None", ignoreCase = true) }.toSet(),
+            musicDirectors = preferencesManager.preferredMusicDirectors.first().filterNot { it.equals("None", ignoreCase = true) }.toSet()
+        )
+    }
+
+    private data class PreferenceProfile(
+        val languages: Set<String> = emptySet(),
+        val singers: Set<String> = emptySet(),
+        val lyricists: Set<String> = emptySet(),
+        val musicDirectors: Set<String> = emptySet()
+    )
+
+    private fun PreferenceProfile.hasSelections(): Boolean {
+        return languages.isNotEmpty() ||
+            singers.isNotEmpty() ||
+            lyricists.isNotEmpty() ||
+            musicDirectors.isNotEmpty()
+    }
+
+    private suspend fun getOnboardingSeedSongs(preferenceProfile: PreferenceProfile): List<SongItem> {
+        if (!preferenceProfile.hasSelections()) return emptyList()
+
+        val key = buildString {
+            append(preferenceProfile.languages.sorted().joinToString(","))
+            append("|")
+            append(preferenceProfile.singers.sorted().joinToString(","))
+            append("|")
+            append(preferenceProfile.lyricists.sorted().joinToString(","))
+            append("|")
+            append(preferenceProfile.musicDirectors.sorted().joinToString(","))
+        }
+
+        val now = System.currentTimeMillis()
+        onboardingSeedCache?.let { cache ->
+            if (cache.key == key && (now - cache.timestampMs) <= 20 * 60 * 1000) {
+                return cache.songs
+            }
+        }
+
+        val queries = buildOnboardingQueries(preferenceProfile)
+        if (queries.isEmpty()) return emptyList()
+
+        val songs = coroutineScope {
+            queries
+                .map { query ->
+                    async {
+                        fetchSeedSongsForQuery(query)
+                    }
+                }
+                .awaitAll()
+                .flatten()
+        }
+            .distinctBy { it.id }
+            .take(80)
+
+        onboardingSeedCache = OnboardingSeedCache(key = key, songs = songs, timestampMs = now)
+        return songs
+    }
+
+    private fun buildOnboardingQueries(preferenceProfile: PreferenceProfile): List<String> {
+        val singerQueries = preferenceProfile.singers
+            .take(5)
+            .flatMap { singer -> listOf("$singer hits", "$singer songs") }
+
+        val languageQueries = preferenceProfile.languages
+            .take(3)
+            .flatMap { language ->
+                languageSearchHints[language.lowercase()] ?: listOf("$language songs")
+            }
+
+        val lyricistQueries = preferenceProfile.lyricists
+            .take(2)
+            .map { lyricist -> "$lyricist songs" }
+
+        val directorQueries = preferenceProfile.musicDirectors
+            .take(2)
+            .map { director -> "$director music" }
+
+        return (singerQueries + languageQueries + lyricistQueries + directorQueries)
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+            .distinct()
+            .take(8)
+    }
+
+    private suspend fun fetchSeedSongsForQuery(query: String): List<SongItem> {
+        return try {
+            val body = JsonObject().apply {
+                addProperty("query", query)
+                add("context", createWebContext())
+            }
+            val response = innerTubeApi.search(body)
+            parseSearchResult(response, SearchFilter.Songs).songs.take(12)
+        } catch (e: Exception) {
+            Log.w(TAG, "Seed query failed ($query): ${e.message}")
+            emptyList()
+        }
+    }
+
+    private fun buildTopArtists(seedSongs: List<Song>, stats: List<ArtistPlayStat>): List<String> {
+        val fromStats = stats
+            .flatMap { stat ->
+                splitArtists(stat.artistName).map { artist -> artist to stat.totalPlays }
+            }
+
+        val fromLikes = seedSongs
+            .filter { it.liked }
+            .flatMap { song ->
+                splitArtists(song.artistsText).map { artist -> artist to 2L }
+            }
+
+        return (fromStats + fromLikes)
+            .groupBy({ it.first }, { it.second })
+            .mapValues { (_, weights) -> weights.sum() }
+            .toList()
+            .sortedByDescending { (_, weight) -> weight }
+            .map { (artist, _) -> artist }
+            .take(5)
+    }
+
+    private fun splitArtists(artistsText: String): List<String> {
+        return artistsText
+            .split(",", "&", "feat.", "ft.", " and ", "/")
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+    }
+
+    private fun diversifyRecommendations(
+        candidates: List<SongItem>,
+        recentlyPlayedIds: Set<String>,
+        refreshNonce: Long
+    ): List<SongItem> {
+        if (candidates.isEmpty()) return emptyList()
+
+        val freshnessPool = candidates.filterNot { recentlyPlayedIds.contains(it.id) }
+            .ifEmpty { candidates }
+            .distinctBy { it.id }
+
+        if (freshnessPool.isEmpty()) return emptyList()
+
+        val shuffled = freshnessPool.shuffled(Random(refreshNonce))
+        if (shuffled.size <= 1) return shuffled
+
+        val positiveNonce = if (refreshNonce < 0) -refreshNonce else refreshNonce
+        val pivot = (positiveNonce % shuffled.size).toInt()
+        return shuffled.drop(pivot) + shuffled.take(pivot)
+    }
+
+    private fun Song.toSongItem(): SongItem {
+        return SongItem(
+            id = id,
+            title = title,
+            artistsText = artistsText,
+            thumbnailUrl = thumbnailUrl,
+            albumId = albumId,
+            duration = duration,
+            localPath = localPath
+        )
+    }
+    
+    suspend fun getArtist(artistId: String): Result<ArtistPage> = withContext(Dispatchers.IO) {
+        try {
+            val body = JsonObject().apply {
+                addProperty("browseId", artistId)
+                add("context", createContext())
+            }
+            
+            val response = innerTubeApi.browse(body)
+            val artistPage = parseArtistPage(response, artistId)
+            Result.success(artistPage)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+    
+    suspend fun getAlbum(albumId: String): Result<AlbumPage> = withContext(Dispatchers.IO) {
+        try {
+            val body = JsonObject().apply {
+                addProperty("browseId", albumId)
+                add("context", createContext())
+            }
+            
+            val response = innerTubeApi.browse(body)
+            val albumPage = parseAlbumPage(response, albumId)
+            Result.success(albumPage)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+    
+    suspend fun getPlaylist(playlistId: String): Result<PlaylistPage> = withContext(Dispatchers.IO) {
+        try {
+            Log.d(TAG, "Loading playlist: $playlistId")
+            val browseId = if (playlistId.startsWith("VL")) playlistId else "VL$playlistId"
+            
+            val body = JsonObject().apply {
+                addProperty("browseId", browseId)
+                add("context", createWebContext())
+            }
+            
+            val response = innerTubeApi.browse(body)
+            val playlistPage = parsePlaylistPage(response, playlistId)
+            Log.d(TAG, "Playlist loaded: ${playlistPage.songs.size} songs")
+            Result.success(playlistPage)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to load playlist", e)
+            Result.failure(e)
+        }
+    }
+    
+    suspend fun getStreamUrl(videoId: String): Result<String> = withContext(Dispatchers.IO) {
+        Log.d(TAG, "===== STREAM RESOLUTION START for $videoId =====")
+
+        suspend fun attempt(
+            strategyName: String,
+            timeoutMs: Long = STRATEGY_TIMEOUT_MS,
+            block: suspend () -> String?
+        ): String? {
+            return try {
+                Log.d(TAG, "Trying $strategyName...")
+                val url = withTimeoutOrNull(timeoutMs) { block() }
+                if (!url.isNullOrBlank() && isUsableStreamUrl(url)) {
+                    Log.d(TAG, "===== SUCCESS: $strategyName returned usable URL =====")
+                    url
+                } else {
+                    Log.d(TAG, "$strategyName timed out, failed, or returned invalid URL")
+                    null
+                }
+            } catch (e: CancellationException) {
+                Log.d(TAG, "$strategyName cancelled")
+                throw e
+            } catch (e: Exception) {
+                Log.w(TAG, "$strategyName exception: ${e.message}")
+                null
+            }
+        }
+
+        val newPipeUrl = attempt("NewPipe extractor fallback", timeoutMs = STRATEGY_TIMEOUT_SLOW_MS) {
+            tryGetStreamUrlFromNewPipe(videoId)
+        }
+        if (newPipeUrl != null) {
+            return@withContext Result.success(newPipeUrl)
+        }
+
+        val iosUrl = attempt("iOS Innertube") {
+            tryGetStreamUrl(videoId, createiOSContext())
+        }
+        if (iosUrl != null) {
+            return@withContext Result.success(iosUrl)
+        }
+
+        val androidUrl = attempt("Android Innertube") {
+            tryGetStreamUrl(videoId, createAndroidContext())
+        }
+        if (androidUrl != null) {
+            return@withContext Result.success(androidUrl)
+        }
+
+        val tvUrl = attempt("TV Innertube", timeoutMs = STRATEGY_TIMEOUT_SLOW_MS) {
+            tryGetStreamUrlTV(videoId)
+        }
+        if (tvUrl != null) {
+            return@withContext Result.success(tvUrl)
+        }
+
+        val webUrl = attempt("Web Innertube") {
+            tryGetStreamUrl(videoId, createWebContext())
+        }
+        if (webUrl != null) {
+            return@withContext Result.success(webUrl)
+        }
+
+        val outerTuneFallbackUrl = attempt("OuterTune-style client fallback") {
+            tryGetStreamUrlFromOuterTuneClientFallbacks(videoId)
+        }
+        if (outerTuneFallbackUrl != null) {
+            return@withContext Result.success(outerTuneFallbackUrl)
+        }
+
+        val watchUrl = attempt("Watch-page extraction", timeoutMs = STRATEGY_TIMEOUT_SLOW_MS) {
+            tryGetStreamUrlFromWatchPage(videoId)
+        }
+        if (watchUrl != null) {
+            return@withContext Result.success(watchUrl)
+        }
+
+        val invidiousUrl = attempt("Invidious fallback", timeoutMs = STRATEGY_TIMEOUT_SLOW_MS) {
+            tryGetStreamUrlFromInvidious(videoId)
+        }
+        if (invidiousUrl != null) {
+            return@withContext Result.success(invidiousUrl)
+        }
+
+        val pipedUrl = attempt("Piped fallback", timeoutMs = STRATEGY_TIMEOUT_SLOW_MS) {
+            tryGetStreamUrlFromPiped(videoId)
+        }
+        if (pipedUrl != null) {
+            return@withContext Result.success(pipedUrl)
+        }
+
+        val videoInfoUrl = attempt("get_video_info fallback") {
+            tryGetStreamUrlFromVideoInfo(videoId)
+        }
+        if (videoInfoUrl != null) {
+            return@withContext Result.success(videoInfoUrl)
+        }
+
+        Log.e(TAG, "===== ALL STRATEGIES FAILED for $videoId =====")
+        Result.failure(Exception("Unable to obtain stream URL from any source"))
+    }
+    
+    private suspend fun tryGetStreamUrlTV(videoId: String): String? {
+        return try {
+            println("  >>> Attempting TV player...")
+            val context = createTVContext().deepCopy().apply {
+                add("thirdParty", JsonObject().apply {
+                    addProperty("embedUrl", "https://www.youtube.com/watch?v=$videoId")
+                })
+            }
+            val body = JsonObject().apply {
+                addProperty("videoId", videoId)
+                addProperty("contentCheckOk", true)
+                addProperty("racyCheckOk", true)
+                add("context", context)
+            }
+            
+            val response = innerTubeApi.player(
+                body = body,
+                apiKey = InnerTubeApi.TVHTML5_API_KEY,
+                clientName = "TVHTML5_SIMPLY_EMBEDDED_PLAYER",
+                clientVersion = "2.0",
+                userAgent = "Mozilla/5.0 (PlayStation 4 5.55) AppleWebKit/601.2 (KHTML, like Gecko)",
+                origin = "https://www.youtube.com",
+                requestOrigin = "https://www.youtube.com",
+                referer = "https://www.youtube.com/"
+            )
+            
+            // Check playability status
+            val playabilityStatus = response.getAsJsonObject("playabilityStatus")
+            val status = playabilityStatus?.get("status")?.asString
+            if (status != "OK") {
+                val reason = playabilityStatus?.get("reason")?.asString
+                println("      Playability status: $status, reason=$reason")
+                Log.w(TAG, "TV Playability status: $status for $videoId, reason=$reason")
+                return null
+            }
+            
+            val url = parseStreamUrl(response)
+            println("      Got URL: ${if (url == null) "NULL" else url.take(60) + "..."}")
+            url
+        } catch (e: Exception) {
+            println("      Exception: ${e.message}")
+            Log.w(TAG, "tryGetStreamUrlTV failed: ${e.message}")
+            null
+        }
+    }
+    
+    /**
+     * Tries to get stream URL from Piped API as a fallback.
+     * Piped is an alternative YouTube frontend that provides direct stream URLs.
+     */
+    private suspend fun tryGetStreamUrlFromPiped(videoId: String): String? {
+        println("  >>> Attempting Piped fallback...")
+        val client = okhttp3.OkHttpClient.Builder()
+            .connectTimeout(4, TimeUnit.SECONDS)
+            .readTimeout(4, TimeUnit.SECONDS)
+            .followRedirects(true)
+            .followSslRedirects(true)
+            .build()
+        val gson = Gson()
+
+        val allInstances = loadPipedInstances(client)
+        val limitedInstances = allInstances.distinct().take(4)
+        println("      Loaded ${allInstances.size} Piped instances, trying ${limitedInstances.size}")
+        
+        limitedInstances.forEach instanceLoop@ { instance ->
+            try {
+                println("      Trying instance: $instance")
+                pipedStreamEndpointTemplates.forEach endpointLoop@ { endpointTemplate ->
+                    val endpoint = endpointTemplate.format(videoId)
+                    val url = instance.removeSuffix("/") + endpoint
+                    println("        Endpoint: $endpoint -> $url")
+                    
+                    val request = okhttp3.Request.Builder()
+                        .url(url)
+                        .header("User-Agent", InnerTubeApi.WEB_USER_AGENT)
+                        .build()
+
+                    client.newCall(request).execute().use { response ->
+                        if (!response.isSuccessful) {
+                            println("          HTTP ${response.code} - skipping")
+                            return@endpointLoop
+                        }
+
+                        val responseBody = response.body?.string() ?: return@endpointLoop
+                        val jsonObject = gson.fromJson(responseBody, JsonObject::class.java) ?: return@endpointLoop
+                        val audioStreams = jsonObject.getAsJsonArray("audioStreams") ?: return@endpointLoop
+                        if (audioStreams.size() == 0) {
+                            println("          No audio streams in response")
+                            return@endpointLoop
+                        }
+
+                        var bestUrl: String? = null
+                        var highestBitrate = 0
+
+                        for (i in 0 until audioStreams.size()) {
+                            val streamObj = audioStreams.get(i).asJsonObject
+                            val streamUrl = streamObj.get("url")?.asString ?: continue
+                            val bitrate = streamObj.get("bitrate")?.asInt ?: 0
+                            if (!isUsableStreamUrl(streamUrl)) continue
+
+                            if (bitrate >= highestBitrate) {
+                                highestBitrate = bitrate
+                                bestUrl = streamUrl
+                            }
+                        }
+
+                        if (!bestUrl.isNullOrBlank()) {
+                            println("        SUCCESS: Got Piped URL at $highestBitrate bps")
+                            Log.d(TAG, "Using Piped stream from $instance$endpoint at bitrate: $highestBitrate")
+                            return bestUrl
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                println("      Piped exception on $instance: ${e.message}")
+                Log.w(TAG, "Piped fallback failed on $instance: ${e.message}")
+            }
+        }
+
+        return null
+    }
+
+    private suspend fun tryGetStreamUrlFromInvidious(videoId: String): String? {
+        val client = okhttp3.OkHttpClient.Builder()
+            .connectTimeout(4, TimeUnit.SECONDS)
+            .readTimeout(4, TimeUnit.SECONDS)
+            .followRedirects(true)
+            .followSslRedirects(true)
+            .build()
+        val gson = Gson()
+
+        for (instance in invidiousApiInstances) {
+            try {
+                val url = "${instance.removeSuffix("/")}/api/v1/videos/$videoId"
+                val request = okhttp3.Request.Builder()
+                    .url(url)
+                    .header("User-Agent", InnerTubeApi.WEB_USER_AGENT)
+                    .build()
+
+                var bestUrl: String? = null
+                var highestBitrate = 0
+
+                val response = client.newCall(request).execute()
+                response.use { currentResponse ->
+                    if (!currentResponse.isSuccessful) {
+                        Log.d(TAG, "Invidious $instance returned HTTP ${currentResponse.code}")
+                        return@use
+                    }
+
+                    val body = currentResponse.body?.string().orEmpty()
+                    if (body.isBlank()) {
+                        return@use
+                    }
+
+                    val root = gson.fromJson(body, JsonObject::class.java) ?: return@use
+                    val adaptiveFormats = root.getAsJsonArray("adaptiveFormats") ?: return@use
+                    if (adaptiveFormats.size() == 0) {
+                        return@use
+                    }
+
+                    for (index in 0 until adaptiveFormats.size()) {
+                        val format = adaptiveFormats.get(index).asJsonObject
+                        val type = format.get("type")?.asString.orEmpty()
+                        if (!type.contains("audio", ignoreCase = true)) {
+                            continue
+                        }
+
+                        val streamUrl = format.get("url")?.asString ?: continue
+                        if (!isUsableStreamUrl(streamUrl)) {
+                            continue
+                        }
+
+                        val bitrate = when {
+                            format.has("bitrate") -> format.get("bitrate")?.asInt ?: 0
+                            format.has("bitrateKbps") -> (format.get("bitrateKbps")?.asInt ?: 0) * 1000
+                            else -> 0
+                        }
+
+                        if (bitrate >= highestBitrate) {
+                            highestBitrate = bitrate
+                            bestUrl = streamUrl
+                        }
+                    }
+                }
+
+                if (!bestUrl.isNullOrBlank()) {
+                    Log.d(TAG, "Using Invidious stream from $instance at bitrate=$highestBitrate")
+                    return bestUrl
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Invidious fallback failed on $instance: ${e.message}")
+            }
+        }
+
+        return null
+    }
+    
+    private suspend fun tryGetStreamUrl(videoId: String, context: JsonObject): String? {
+        val clientName = context.getAsJsonObject("client")?.get("clientName")?.asString ?: "UNKNOWN"
+        return try {
+            Log.d(TAG, "Attempting $clientName player...")
+            
+            val body = JsonObject().apply {
+                addProperty("videoId", videoId)
+                addProperty("contentCheckOk", true)
+                addProperty("racyCheckOk", true)
+                add("context", context)
+            }
+
+            val clientConfig = resolvePlayerClientConfig(context)
+            val response = innerTubeApi.player(
+                body = body,
+                apiKey = clientConfig.apiKey,
+                clientName = clientConfig.headerClientName,
+                clientVersion = clientConfig.clientVersion,
+                userAgent = clientConfig.userAgent,
+                origin = clientConfig.origin,
+                requestOrigin = clientConfig.origin,
+                referer = clientConfig.referer
+            )
+            
+            Log.d(TAG, "$clientName response keys: ${response.keySet().joinToString(",")}")
+            
+            // Check playability status
+            val playabilityStatus = response.getAsJsonObject("playabilityStatus")
+            val status = playabilityStatus?.get("status")?.asString
+            Log.d(TAG, "$clientName playability: $status")
+            
+            if (status != "OK") {
+                val reason = playabilityStatus?.get("reason")?.asString
+                val messages = playabilityStatus?.getAsJsonArray("messages")?.joinToString(";") { it.asString } ?: "none"
+                Log.w(TAG, "$clientName ERROR - Status: $status, Reason: $reason, Messages: $messages")
+                return null
+            }
+            
+            // Check if streamingData exists
+            val streamingData = response.getAsJsonObject("streamingData")
+            if (streamingData == null) {
+                Log.w(TAG, "$clientName returned OK but NO streamingData! Checking alternatives...")
+                Log.d(TAG, "$clientName full response preview: ${response.toString().take(300)}")
+                return null
+            }
+            
+            val url = parseStreamUrl(response)
+            Log.d(TAG, "$clientName parseStreamUrl returned: ${if (url == null) "NULL" else url.take(100)}")
+            url
+        } catch (e: Exception) {
+            Log.e(TAG, "$clientName exception: ${e.message}", e)
+            null
+        }
+    }
+
+    private suspend fun tryGetStreamUrlFromOuterTuneClientFallbacks(videoId: String): String? {
+        val contexts = listOf(
+            "ANDROID_VR" to createAndroidVrContext(),
+            "ANDROID" to createAndroidClientContext(),
+            "WEB_CREATOR" to createWebCreatorContext(),
+            "IOS" to createiOSContext()
+        )
+
+        var firstCandidate: String? = null
+
+        for ((label, context) in contexts) {
+            val url = tryGetStreamUrl(videoId, context) ?: continue
+            if (firstCandidate == null) {
+                firstCandidate = url
+            }
+
+            if (validateStreamUrlStatus(url)) {
+                Log.d(TAG, "OuterTune-style fallback validated stream with client=$label")
+                return url
+            }
+
+            Log.d(TAG, "OuterTune-style candidate failed quick validation for client=$label")
+        }
+
+        return firstCandidate
+    }
+
+    private fun validateStreamUrlStatus(url: String): Boolean {
+        return try {
+            val request = okhttp3.Request.Builder()
+                .url(url)
+                .header("Range", "bytes=0-1")
+                .header("User-Agent", InnerTubeApi.WEB_USER_AGENT)
+                .get()
+                .build()
+
+            extractorHttpClient.newCall(request).execute().use { response ->
+                response.isSuccessful || response.code == 206
+            }
+        } catch (e: Exception) {
+            Log.d(TAG, "Stream status validation failed: ${e.message}")
+            false
+        }
+    }
+
+    private suspend fun tryGetStreamUrlFromVideoInfo(videoId: String): String? {
+        return try {
+            println("  >>> Attempting get_video_info fallback...")
+            val client = okhttp3.OkHttpClient.Builder()
+                .connectTimeout(10, TimeUnit.SECONDS)
+                .readTimeout(10, TimeUnit.SECONDS)
+                .followRedirects(true)
+                .followSslRedirects(true)
+                .build()
+
+            val request = okhttp3.Request.Builder()
+                .url("https://www.youtube.com/get_video_info?video_id=$videoId&el=detailpage&hl=en")
+                .header("User-Agent", InnerTubeApi.WEB_USER_AGENT)
+                .build()
+
+            client.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) {
+                    println("      HTTP ${response.code} - request failed")
+                    Log.w(TAG, "get_video_info failed: ${response.code}")
+                    return null
+                }
+
+                val body = response.body?.string().orEmpty()
+                if (body.isBlank()) {
+                    println("      Empty response body")
+                    return null
+                }
+
+                val pairs = body
+                    .split("&")
+                    .mapNotNull { entry ->
+                        val parts = entry.split("=", limit = 2)
+                        if (parts.size != 2) {
+                            null
+                        } else {
+                            parts[0] to URLDecoder.decode(parts[1], "UTF-8")
+                        }
+                    }
+                    .toMap()
+
+                val playerResponseRaw = pairs["player_response"] ?: return null
+                val playerResponse = Gson().fromJson(playerResponseRaw, JsonObject::class.java) ?: return null
+                parseStreamUrl(playerResponse)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "tryGetStreamUrlFromVideoInfo failed: ${e.message}")
+            null
+        }
+    }
+
+    private suspend fun tryGetStreamUrlFromWatchPage(videoId: String): String? {
+        println("  >>> Attempting watch-page HTML parsing...")
+        val client = okhttp3.OkHttpClient.Builder()
+            .connectTimeout(10, TimeUnit.SECONDS)
+            .readTimeout(10, TimeUnit.SECONDS)
+            .followRedirects(true)
+            .followSslRedirects(true)
+            .build()
+
+        val watchUrls = listOf(
+            "https://www.youtube.com/watch?v=$videoId&hl=en",
+            "https://music.youtube.com/watch?v=$videoId"
+        )
+
+        for (url in watchUrls) {
+            try {
+                println("      Trying URL: $url")
+                val request = okhttp3.Request.Builder()
+                    .url(url)
+                    .header("User-Agent", InnerTubeApi.WEB_USER_AGENT)
+                    .build()
+
+                client.newCall(request).execute().use { response ->
+                    if (!response.isSuccessful) {
+                        println("        HTTP ${response.code} - failed")
+                        return@use
+                    }
+                    val html = response.body?.string().orEmpty()
+                    if (html.isBlank()) {
+                        println("        Empty HTML response")
+                        return@use
+                    }
+
+                    println("        Got ${html.length} bytes of HTML")
+
+                    val playerScriptUrl = parsePlayerScriptUrlFromHtml(html)
+                    if (!playerScriptUrl.isNullOrBlank()) {
+                        ensureSignatureDecipherPlan(playerScriptUrl, client)
+                    }
+
+                    val playerResponse = parsePlayerResponseFromHtml(html)
+                    if (playerResponse == null) {
+                        println("        Failed to parse ytInitialPlayerResponse from HTML")
+                        return@use
+                    }
+                    
+                    val streamUrl = parseStreamUrl(playerResponse)
+                    println("        parseStreamUrl returned: ${if (streamUrl == null) "NULL" else streamUrl.take(60) + "..."}")
+                    
+                    if (isUsableStreamUrl(streamUrl)) {
+                        println("      SUCCESS: Got usable URL from watch page")
+                        return streamUrl
+                    }
+                }
+            } catch (e: Exception) {
+                println("      Exception: ${e.message}")
+                Log.w(TAG, "Watch page fallback failed for $url: ${e.message}")
+            }
+        }
+
+        println("      All watch page URLs exhausted")
+        return null
+    }
+
+    private suspend fun tryGetStreamUrlFromNewPipe(videoId: String): String? {
+        return try {
+            ensureNewPipeInitialized()
+            val watchUrl = "https://www.youtube.com/watch?v=$videoId"
+            val streamInfo = StreamInfo.getInfo(ServiceList.YouTube, watchUrl)
+
+            val bestAudioStream = selectBestAudioStream(streamInfo.audioStreams)
+            val bestAudioUrl = bestAudioStream?.url
+            if (isUsableStreamUrl(bestAudioUrl)) {
+                Log.d(TAG, "Using NewPipe stream at bitrate=${resolveAudioBitrate(bestAudioStream)}")
+                return bestAudioUrl
+            }
+
+            if (isUsableStreamUrl(streamInfo.hlsUrl)) {
+                Log.d(TAG, "Using NewPipe HLS manifest fallback")
+                return streamInfo.hlsUrl
+            }
+
+            if (isUsableStreamUrl(streamInfo.dashMpdUrl)) {
+                Log.d(TAG, "Using NewPipe DASH manifest fallback")
+                return streamInfo.dashMpdUrl
+            }
+
+            Log.w(TAG, "NewPipe returned no usable URLs for $videoId")
+            null
+        } catch (e: Exception) {
+            Log.w(TAG, "NewPipe fallback failed for $videoId: ${e.message}")
+            null
+        }
+    }
+
+    private fun ensureNewPipeInitialized() {
+        if (newPipeInitialized) return
+
+        synchronized(newPipeInitLock) {
+            if (newPipeInitialized) return
+            NewPipe.init(NewPipeOkHttpDownloader(extractorHttpClient))
+            newPipeInitialized = true
+            Log.d(TAG, "Initialized NewPipe extractor")
+        }
+    }
+
+    private fun selectBestAudioStream(audioStreams: List<AudioStream>?): AudioStream? {
+        if (audioStreams.isNullOrEmpty()) return null
+        return audioStreams
+            .filter { stream -> isUsableStreamUrl(stream.url) }
+            .maxByOrNull { stream -> resolveAudioBitrate(stream) }
+    }
+
+    private fun resolveAudioBitrate(stream: AudioStream?): Int {
+        if (stream == null) return 0
+        return maxOf(stream.averageBitrate, stream.bitrate, 0)
+    }
+
+    private fun parsePlayerResponseFromHtml(html: String): JsonObject? {
+        val assignmentMarker = "ytInitialPlayerResponse ="
+        val assignmentIndex = html.indexOf(assignmentMarker)
+        if (assignmentIndex >= 0) {
+            val jsonStart = html.indexOf('{', assignmentIndex + assignmentMarker.length)
+            val jsonText = extractJsonObjectFromText(html, jsonStart)
+            if (!jsonText.isNullOrBlank()) {
+                return Gson().fromJson(jsonText, JsonObject::class.java)
+            }
+        }
+
+        val embeddedMarker = "\"ytInitialPlayerResponse\":"
+        val embeddedIndex = html.indexOf(embeddedMarker)
+        if (embeddedIndex >= 0) {
+            val jsonStart = html.indexOf('{', embeddedIndex + embeddedMarker.length)
+            val jsonText = extractJsonObjectFromText(html, jsonStart)
+            if (!jsonText.isNullOrBlank()) {
+                return Gson().fromJson(jsonText, JsonObject::class.java)
+            }
+        }
+
+        return null
+    }
+
+    private fun parsePlayerScriptUrlFromHtml(html: String): String? {
+        val patterns = listOf(
+            Regex("\"jsUrl\"\\s*:\\s*\"([^\"]+base\\.js[^\"]*)\""),
+            Regex("\"PLAYER_JS_URL\"\\s*:\\s*\"([^\"]+base\\.js[^\"]*)\""),
+            Regex("\"js\"\\s*:\\s*\"([^\"]+base\\.js[^\"]*)\"")
+        )
+
+        for (pattern in patterns) {
+            val match = pattern.find(html) ?: continue
+            val rawUrl = match.groupValues.getOrNull(1).orEmpty()
+            val decodedUrl = rawUrl
+                .replace("\\/", "/")
+                .replace("\\u0026", "&")
+                .replace("\\u002F", "/")
+                .trim()
+
+            if (decodedUrl.isBlank()) continue
+
+            return when {
+                decodedUrl.startsWith("http://") || decodedUrl.startsWith("https://") -> decodedUrl
+                decodedUrl.startsWith("//") -> "https:$decodedUrl"
+                decodedUrl.startsWith("/") -> "https://www.youtube.com$decodedUrl"
+                else -> "https://www.youtube.com/$decodedUrl"
+            }
+        }
+
+        return null
+    }
+
+    private fun ensureSignatureDecipherPlan(playerScriptUrl: String, client: okhttp3.OkHttpClient) {
+        val cachedPlan = signatureDecipherPlanCache
+        if (cachedPlan != null && cachedPlan.playerScriptUrl == playerScriptUrl && cachedPlan.operations.isNotEmpty()) {
+            return
+        }
+
+        try {
+            val request = okhttp3.Request.Builder()
+                .url(playerScriptUrl)
+                .header("User-Agent", InnerTubeApi.WEB_USER_AGENT)
+                .build()
+
+            client.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) {
+                    Log.d(TAG, "Player script request failed: HTTP ${response.code}")
+                    return
+                }
+
+                val script = response.body?.string().orEmpty()
+                if (script.isBlank()) {
+                    return
+                }
+
+                val functionName = extractSignatureFunctionName(script) ?: return
+                val functionBody = extractFunctionBody(script, functionName) ?: return
+
+                val helperObjectName = extractHelperObjectName(functionBody)
+                val helperMethods = if (!helperObjectName.isNullOrBlank()) {
+                    extractHelperMethods(script, helperObjectName)
+                } else {
+                    emptyMap()
+                }
+
+                val operations = extractSignatureOperations(functionBody, helperObjectName, helperMethods)
+                if (operations.isEmpty()) {
+                    Log.d(TAG, "No signature operations extracted from player script")
+                    return
+                }
+
+                signatureDecipherPlanCache = SignatureDecipherPlan(
+                    playerScriptUrl = playerScriptUrl,
+                    operations = operations
+                )
+                Log.d(TAG, "Loaded signature decipher plan with ${operations.size} operations")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to build signature decipher plan: ${e.message}")
+        }
+    }
+
+    private fun extractSignatureFunctionName(script: String): String? {
+        val patterns = listOf(
+            Regex("\\.sig\\|\\|([\\w$]+)\\("),
+            Regex("[\"']signature[\"']\\s*,\\s*([\\w$]+)\\("),
+            Regex("\\bc&&\\(c=([\\w$]+)\\(decodeURIComponent\\(c\\)\\)\\)")
+        )
+
+        return patterns.firstNotNullOfOrNull { regex ->
+            regex.find(script)?.groupValues?.getOrNull(1)
+        }
+    }
+
+    private fun extractFunctionBody(script: String, functionName: String): String? {
+        val escapedFunctionName = Regex.escape(functionName)
+        val definitions = listOf(
+            Regex("function\\s+$escapedFunctionName\\s*\\([\\w$]+\\)\\s*\\{"),
+            Regex("(?:var|let|const)\\s+$escapedFunctionName\\s*=\\s*function\\s*\\([\\w$]+\\)\\s*\\{"),
+            Regex("$escapedFunctionName\\s*=\\s*function\\s*\\([\\w$]+\\)\\s*\\{")
+        )
+
+        for (definition in definitions) {
+            val match = definition.find(script) ?: continue
+            val braceStart = script.indexOf('{', match.range.first)
+            val block = extractBracedBlock(script, braceStart) ?: continue
+            return block.removePrefix("{").removeSuffix("}")
+        }
+
+        return null
+    }
+
+    private fun extractHelperObjectName(functionBody: String): String? {
+        val operationCall = Regex("([\\w$]{2,})\\.([\\w$]{2,})\\([\\w$]+(?:,\\d+)?\\)")
+        return operationCall.find(functionBody)?.groupValues?.getOrNull(1)
+    }
+
+    private fun extractHelperMethods(
+        script: String,
+        helperObjectName: String
+    ): Map<String, SignatureOperationType> {
+        val escapedHelperObjectName = Regex.escape(helperObjectName)
+        val definitions = listOf(
+            Regex("(?:var|let|const)\\s+$escapedHelperObjectName\\s*=\\s*\\{"),
+            Regex("$escapedHelperObjectName\\s*=\\s*\\{")
+        )
+
+        var objectBody: String? = null
+        for (definition in definitions) {
+            val match = definition.find(script) ?: continue
+            val braceStart = script.indexOf('{', match.range.first)
+            val block = extractBracedBlock(script, braceStart)
+            if (!block.isNullOrBlank()) {
+                objectBody = block.removePrefix("{").removeSuffix("}")
+                break
+            }
+        }
+
+        if (objectBody.isNullOrBlank()) {
+            return emptyMap()
+        }
+
+        val methodMap = mutableMapOf<String, SignatureOperationType>()
+
+        val functionPropertyPattern = Regex("([\\w$]+)\\s*:\\s*function\\s*\\([\\w$]+(?:,[\\w$]+)?\\)\\s*\\{")
+        functionPropertyPattern.findAll(objectBody).forEach { match ->
+            val methodName = match.groupValues.getOrNull(1).orEmpty()
+            val braceStart = objectBody.indexOf('{', match.range.first)
+            val methodBlock = extractBracedBlock(objectBody, braceStart)
+            if (!methodBlock.isNullOrBlank()) {
+                val operationType = inferSignatureOperationType(methodBlock)
+                if (operationType != null) {
+                    methodMap[methodName] = operationType
+                }
+            }
+        }
+
+        val shorthandMethodPattern = Regex("([\\w$]+)\\s*\\([\\w$]+(?:,[\\w$]+)?\\)\\s*\\{")
+        shorthandMethodPattern.findAll(objectBody).forEach { match ->
+            val methodName = match.groupValues.getOrNull(1).orEmpty()
+            if (methodMap.containsKey(methodName)) return@forEach
+
+            val braceStart = objectBody.indexOf('{', match.range.first)
+            val methodBlock = extractBracedBlock(objectBody, braceStart)
+            if (!methodBlock.isNullOrBlank()) {
+                val operationType = inferSignatureOperationType(methodBlock)
+                if (operationType != null) {
+                    methodMap[methodName] = operationType
+                }
+            }
+        }
+
+        return methodMap
+    }
+
+    private fun inferSignatureOperationType(methodBody: String): SignatureOperationType? {
+        val normalized = methodBody.replace("\n", " ")
+        return when {
+            normalized.contains("reverse()") -> SignatureOperationType.REVERSE
+            normalized.contains("splice(0,") || normalized.contains(".slice(") -> SignatureOperationType.SLICE
+            (normalized.contains("[0]") && normalized.contains("%") && normalized.contains(".length")) ||
+                (normalized.contains("var") && normalized.contains("[0]") && normalized.contains("=")) -> {
+                SignatureOperationType.SWAP
+            }
+            else -> null
+        }
+    }
+
+    private fun extractSignatureOperations(
+        functionBody: String,
+        helperObjectName: String?,
+        helperMethods: Map<String, SignatureOperationType>
+    ): List<SignatureOperation> {
+        val operations = mutableListOf<SignatureOperation>()
+
+        if (!helperObjectName.isNullOrBlank() && helperMethods.isNotEmpty()) {
+            val callPattern = Regex("${Regex.escape(helperObjectName)}\\.([\\w$]+)\\([\\w$]+(?:,(\\d+))?\\)")
+            callPattern.findAll(functionBody).forEach { match ->
+                val methodName = match.groupValues.getOrNull(1).orEmpty()
+                val operationType = helperMethods[methodName] ?: return@forEach
+                val argument = match.groupValues.getOrNull(2)?.toIntOrNull() ?: 0
+                operations.add(SignatureOperation(operationType, argument))
+            }
+        }
+
+        if (operations.isNotEmpty()) {
+            return operations
+        }
+
+        val simpleOperations = mutableListOf<Pair<Int, SignatureOperation>>()
+
+        Regex("\\.reverse\\(\\)").findAll(functionBody).forEach { match ->
+            simpleOperations.add(match.range.first to SignatureOperation(SignatureOperationType.REVERSE))
+        }
+
+        Regex("\\.splice\\(0,(\\d+)\\)").findAll(functionBody).forEach { match ->
+            val argument = match.groupValues.getOrNull(1)?.toIntOrNull() ?: 0
+            simpleOperations.add(match.range.first to SignatureOperation(SignatureOperationType.SLICE, argument))
+        }
+
+        Regex("\\.slice\\((\\d+)\\)").findAll(functionBody).forEach { match ->
+            val argument = match.groupValues.getOrNull(1)?.toIntOrNull() ?: 0
+            simpleOperations.add(match.range.first to SignatureOperation(SignatureOperationType.SLICE, argument))
+        }
+
+        Regex("\\[0\\]\\s*=\\s*[\\w$]+\\[(\\d+)\\s*%\\s*[\\w$]+\\.length\\]").findAll(functionBody).forEach { match ->
+            val argument = match.groupValues.getOrNull(1)?.toIntOrNull() ?: 0
+            simpleOperations.add(match.range.first to SignatureOperation(SignatureOperationType.SWAP, argument))
+        }
+
+        return simpleOperations
+            .sortedBy { it.first }
+            .map { it.second }
+    }
+
+    private fun decipherSignature(obfuscatedSignature: String): String? {
+        val plan = signatureDecipherPlanCache ?: return null
+        if (plan.operations.isEmpty()) return null
+
+        val chars = obfuscatedSignature.toMutableList()
+        if (chars.isEmpty()) return null
+
+        plan.operations.forEach { operation ->
+            when (operation.type) {
+                SignatureOperationType.REVERSE -> chars.reverse()
+                SignatureOperationType.SLICE -> {
+                    val count = operation.argument.coerceAtLeast(0)
+                    repeat(count.coerceAtMost(chars.size)) {
+                        chars.removeAt(0)
+                    }
+                }
+                SignatureOperationType.SWAP -> {
+                    if (chars.isNotEmpty()) {
+                        val index = operation.argument.mod(chars.size)
+                        val first = chars[0]
+                        chars[0] = chars[index]
+                        chars[index] = first
+                    }
+                }
+            }
+        }
+
+        return chars.joinToString(separator = "")
+    }
+
+    private fun extractJsonObjectFromText(text: String, startIndex: Int): String? {
+        if (startIndex < 0 || startIndex >= text.length || text[startIndex] != '{') return null
+
+        var depth = 0
+        var inString = false
+        var escaped = false
+
+        for (index in startIndex until text.length) {
+            val ch = text[index]
+
+            if (inString) {
+                if (escaped) {
+                    escaped = false
+                } else if (ch == '\\') {
+                    escaped = true
+                } else if (ch == '"') {
+                    inString = false
+                }
+                continue
+            }
+
+            when (ch) {
+                '"' -> inString = true
+                '{' -> depth++
+                '}' -> {
+                    depth--
+                    if (depth == 0) {
+                        return text.substring(startIndex, index + 1)
+                    }
+                }
+            }
+        }
+
+        return null
+    }
+
+    private fun extractBracedBlock(text: String, startIndex: Int): String? {
+        if (startIndex < 0 || startIndex >= text.length || text[startIndex] != '{') return null
+
+        var depth = 0
+        var escaped = false
+        var stringDelimiter: Char? = null
+
+        for (index in startIndex until text.length) {
+            val currentChar = text[index]
+
+            if (stringDelimiter != null) {
+                if (escaped) {
+                    escaped = false
+                } else if (currentChar == '\\') {
+                    escaped = true
+                } else if (currentChar == stringDelimiter) {
+                    stringDelimiter = null
+                }
+                continue
+            }
+
+            when (currentChar) {
+                '\'', '"' -> stringDelimiter = currentChar
+                '{' -> depth++
+                '}' -> {
+                    depth--
+                    if (depth == 0) {
+                        return text.substring(startIndex, index + 1)
+                    }
+                }
+            }
+        }
+
+        return null
+    }
+
+    private fun loadPipedInstances(client: okhttp3.OkHttpClient): List<String> {
+        val now = System.currentTimeMillis()
+        pipedInstancesCache?.let { (instances, timestamp) ->
+            if ((now - timestamp) <= PIPED_INSTANCE_CACHE_TTL_MS && instances.isNotEmpty()) {
+                return instances
+            }
+        }
+
+        val discoveredInstances = try {
+            val request = okhttp3.Request.Builder()
+                .url(PIPED_INSTANCE_LIST_URL)
+                .header("User-Agent", InnerTubeApi.WEB_USER_AGENT)
+                .build()
+
+            client.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) {
+                    emptyList()
+                } else {
+                    val markdown = response.body?.string().orEmpty()
+                    Regex("\\|\\s*[^|]+\\|\\s*(https://[^|\\s]+)\\s*\\|")
+                        .findAll(markdown)
+                        .mapNotNull { match -> match.groupValues.getOrNull(1) }
+                        .filter { url -> url.contains("pipedapi") || url.contains("api.piped") || url.contains("piped-api") }
+                        .toList()
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to fetch dynamic Piped instances: ${e.message}")
+            emptyList()
+        }
+
+        val mergedInstances = (pipedApiInstances + discoveredInstances)
+            .map { it.trim().removeSuffix("/") }
+            .filter { it.startsWith("https://") }
+            .distinct()
+
+        pipedInstancesCache = mergedInstances to now
+        return mergedInstances
+    }
+    
+    suspend fun getRelatedSongs(videoId: String): Result<List<SongItem>> = withContext(Dispatchers.IO) {
+        try {
+            val body = JsonObject().apply {
+                addProperty("videoId", videoId)
+                addProperty("isAudioOnly", true)
+                add("context", createContext())
+            }
+            
+            val response = innerTubeApi.next(body)
+            val relatedSongs = parseRelatedSongs(response)
+            Result.success(relatedSongs)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+    
+    fun getSearchHistory(): Flow<List<SearchHistory>> = searchHistoryDao.getSearchHistory()
+    
+    suspend fun deleteSearchHistory(query: String) = searchHistoryDao.delete(query)
+    
+    suspend fun clearSearchHistory() = searchHistoryDao.clearAll()
+    
+    // Parsing helpers
+    private fun parseSearchResult(response: JsonObject, filter: SearchFilter): SearchResult {
+        val songs = mutableListOf<SongItem>()
+        val artists = mutableListOf<ArtistItem>()
+        val albums = mutableListOf<AlbumItem>()
+        val playlists = mutableListOf<PlaylistItem>()
+        val videos = mutableListOf<VideoItem>()
+        
+        try {
+            // Try tabbedSearchResultsRenderer first (newer format)
+            var contents = response.getAsJsonObject("contents")
+                ?.getAsJsonObject("tabbedSearchResultsRenderer")
+                ?.getAsJsonArray("tabs")
+                ?.get(0)?.asJsonObject
+                ?.getAsJsonObject("tabRenderer")
+                ?.getAsJsonObject("content")
+                ?.getAsJsonObject("sectionListRenderer")
+                ?.getAsJsonArray("contents")
+            
+            // Fallback to searchResultsRenderer (older format)
+            if (contents == null) {
+                contents = response.getAsJsonObject("contents")
+                    ?.getAsJsonObject("sectionListRenderer")
+                    ?.getAsJsonArray("contents")
+                Log.d(TAG, "Using sectionListRenderer fallback for search")
+            }
+            
+            Log.d(TAG, "Search contents found: ${contents?.size() ?: 0} sections")
+            
+            contents?.forEach { section ->
+                val sectionObj = section.asJsonObject
+                val musicShelf = sectionObj.getAsJsonObject("musicShelfRenderer")
+                    ?: sectionObj.getAsJsonObject("musicCardShelfRenderer")
+                    ?: sectionObj.getAsJsonObject("itemSectionRenderer")
+                        ?.getAsJsonArray("contents")
+                        ?.firstOrNull()?.asJsonObject
+                        ?.getAsJsonObject("musicShelfRenderer")
+                
+                musicShelf?.let { shelf ->
+                    val shelfContents = shelf.getAsJsonArray("contents")
+                    Log.d(TAG, "Processing shelf with ${shelfContents?.size() ?: 0} items")
+                    
+                    shelfContents?.forEach { item ->
+                        val itemObj = item.asJsonObject
+                        val musicItem = itemObj.getAsJsonObject("musicResponsiveListItemRenderer")
+                            ?: itemObj.getAsJsonObject("musicTwoRowItemRenderer")
+                        
+                        musicItem?.let { mi ->
+                            parseMusicItem(mi)?.let { parsed ->
+                                when (parsed) {
+                                    is SongItem -> songs.add(parsed)
+                                    is ArtistItem -> artists.add(parsed)
+                                    is AlbumItem -> albums.add(parsed)
+                                    is PlaylistItem -> playlists.add(parsed)
+                                    is VideoItem -> videos.add(parsed)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Search parsing error", e)
+        }
+        
+        return SearchResult(songs, artists, albums, playlists, videos)
+    }
+    
+    private fun parseMusicItem(item: JsonObject): Any? {
+        return try {
+            val flexColumns = item.getAsJsonArray("flexColumns")
+            val fixedColumns = item.getAsJsonArray("fixedColumns")
+            
+            if (flexColumns == null || flexColumns.size() == 0) return null
+            
+            val titleRuns = flexColumns[0].asJsonObject
+                .getAsJsonObject("musicResponsiveListItemFlexColumnRenderer")
+                ?.getAsJsonObject("text")
+                ?.getAsJsonArray("runs")
+            
+            val title = titleRuns?.firstOrNull()?.asJsonObject?.get("text")?.asString ?: return null
+            
+            val navigationEndpoint = titleRuns?.firstOrNull()?.asJsonObject
+                ?.getAsJsonObject("navigationEndpoint")
+            
+            val watchEndpoint = navigationEndpoint?.getAsJsonObject("watchEndpoint")
+            val browseEndpoint = navigationEndpoint?.getAsJsonObject("browseEndpoint")
+            
+            if (watchEndpoint != null) {
+                val videoId = watchEndpoint.get("videoId")?.asString ?: return null
+                
+                val artistsText = if (flexColumns.size() > 1) {
+                    flexColumns[1].asJsonObject
+                        .getAsJsonObject("musicResponsiveListItemFlexColumnRenderer")
+                        ?.getAsJsonObject("text")
+                        ?.getAsJsonArray("runs")
+                        ?.firstOrNull()?.asJsonObject
+                        ?.get("text")?.asString ?: "Unknown Artist"
+                } else "Unknown Artist"
+                
+                val thumbnailUrl = item.getAsJsonObject("thumbnail")
+                    ?.getAsJsonObject("musicThumbnailRenderer")
+                    ?.getAsJsonObject("thumbnail")
+                    ?.getAsJsonArray("thumbnails")
+                    ?.lastOrNull()?.asJsonObject
+                    ?.get("url")?.asString
+                
+                SongItem(
+                    id = videoId,
+                    title = title,
+                    artistsText = artistsText,
+                    thumbnailUrl = thumbnailUrl
+                )
+            } else if (browseEndpoint != null) {
+                val browseId = browseEndpoint.get("browseId")?.asString ?: return null
+                val pageType = browseEndpoint.getAsJsonObject("browseEndpointContextSupportedConfigs")
+                    ?.getAsJsonObject("browseEndpointContextMusicConfig")
+                    ?.get("pageType")?.asString
+                
+                val thumbnailUrl = item.getAsJsonObject("thumbnail")
+                    ?.getAsJsonObject("musicThumbnailRenderer")
+                    ?.getAsJsonObject("thumbnail")
+                    ?.getAsJsonArray("thumbnails")
+                    ?.lastOrNull()?.asJsonObject
+                    ?.get("url")?.asString
+                
+                when (pageType) {
+                    "MUSIC_PAGE_TYPE_ARTIST" -> ArtistItem(browseId, title, thumbnailUrl)
+                    "MUSIC_PAGE_TYPE_ALBUM" -> AlbumItem(browseId, title, thumbnailUrl = thumbnailUrl)
+                    "MUSIC_PAGE_TYPE_PLAYLIST" -> PlaylistItem(browseId, title, thumbnailUrl = thumbnailUrl)
+                    else -> null
+                }
+            } else null
+        } catch (e: Exception) {
+            null
+        }
+    }
+    
+    private fun parseSearchSuggestions(response: JsonObject): List<String> {
+        val suggestions = mutableListOf<String>()
+        
+        try {
+            val contents = response.getAsJsonArray("contents")
+            contents?.forEach { content ->
+                val suggestionObj = content.asJsonObject
+                    .getAsJsonObject("searchSuggestionsSectionRenderer")
+                    ?.getAsJsonArray("contents")
+                
+                suggestionObj?.forEach { suggestion ->
+                    val suggestionRenderer = suggestion.asJsonObject
+                        .getAsJsonObject("searchSuggestionRenderer")
+                    
+                    suggestionRenderer?.getAsJsonObject("navigationEndpoint")
+                        ?.getAsJsonObject("searchEndpoint")
+                        ?.get("query")?.asString
+                        ?.let { suggestions.add(it) }
+                }
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+        
+        return suggestions
+    }
+    
+    private fun parseHomeContent(response: JsonObject): HomeContent {
+        val quickPicks = mutableListOf<SongItem>()
+        val trendingSongs = mutableListOf<SongItem>()
+        val newReleases = mutableListOf<AlbumItem>()
+        val recommendedPlaylists = mutableListOf<PlaylistItem>()
+        val moodsAndGenres = mutableListOf<MoodGenreItem>()
+        
+        try {
+            val contents = response.getAsJsonObject("contents")
+                ?.getAsJsonObject("singleColumnBrowseResultsRenderer")
+                ?.getAsJsonArray("tabs")
+                ?.firstOrNull()?.asJsonObject
+                ?.getAsJsonObject("tabRenderer")
+                ?.getAsJsonObject("content")
+                ?.getAsJsonObject("sectionListRenderer")
+                ?.getAsJsonArray("contents")
+            
+            contents?.forEach { section ->
+                val shelf = section.asJsonObject
+                    .getAsJsonObject("musicCarouselShelfRenderer")
+                    ?: section.asJsonObject.getAsJsonObject("musicImmersiveCarouselShelfRenderer")
+                
+                shelf?.let { parseHomeShelf(it, quickPicks, trendingSongs, newReleases, recommendedPlaylists) }
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+        
+        val greeting = getGreeting()
+        
+        return HomeContent(
+            greeting = greeting,
+            quickPicks = quickPicks,
+            trendingSongs = trendingSongs,
+            newReleases = newReleases,
+            recommendedPlaylists = recommendedPlaylists,
+            moodsAndGenres = moodsAndGenres
+        )
+    }
+    
+    private fun parseHomeShelf(
+        shelf: JsonObject,
+        quickPicks: MutableList<SongItem>,
+        trendingSongs: MutableList<SongItem>,
+        newReleases: MutableList<AlbumItem>,
+        recommendedPlaylists: MutableList<PlaylistItem>
+    ) {
+        // Get the shelf title to determine the type
+        val shelfTitle = shelf.getAsJsonObject("header")
+            ?.getAsJsonObject("musicCarouselShelfBasicHeaderRenderer")
+            ?.getAsJsonObject("title")
+            ?.getAsJsonArray("runs")
+            ?.firstOrNull()?.asJsonObject
+            ?.get("text")?.asString?.lowercase() ?: ""
+        
+        val contents = shelf.getAsJsonArray("contents")
+        
+        contents?.forEach { item ->
+            val itemObj = item.asJsonObject
+            val twoRowItem = itemObj.getAsJsonObject("musicTwoRowItemRenderer")
+            val responsiveItem = itemObj.getAsJsonObject("musicResponsiveListItemRenderer")
+            
+            // Parse musicResponsiveListItemRenderer (used for Quick picks, Listen again, etc.)
+            responsiveItem?.let { responsive ->
+                // Get video ID from overlay or navigation endpoint
+                val videoId = responsive.getAsJsonObject("overlay")
+                    ?.getAsJsonObject("musicItemThumbnailOverlayRenderer")
+                    ?.getAsJsonObject("content")
+                    ?.getAsJsonObject("musicPlayButtonRenderer")
+                    ?.getAsJsonObject("playNavigationEndpoint")
+                    ?.getAsJsonObject("watchEndpoint")
+                    ?.get("videoId")?.asString
+                    ?: responsive.getAsJsonArray("flexColumns")
+                        ?.firstOrNull()?.asJsonObject
+                        ?.getAsJsonObject("musicResponsiveListItemFlexColumnRenderer")
+                        ?.getAsJsonObject("text")
+                        ?.getAsJsonArray("runs")
+                        ?.firstOrNull()?.asJsonObject
+                        ?.getAsJsonObject("navigationEndpoint")
+                        ?.getAsJsonObject("watchEndpoint")
+                        ?.get("videoId")?.asString
+                
+                if (videoId != null) {
+                    // Get title from flexColumns
+                    val title = responsive.getAsJsonArray("flexColumns")
+                        ?.firstOrNull()?.asJsonObject
+                        ?.getAsJsonObject("musicResponsiveListItemFlexColumnRenderer")
+                        ?.getAsJsonObject("text")
+                        ?.getAsJsonArray("runs")
+                        ?.firstOrNull()?.asJsonObject
+                        ?.get("text")?.asString ?: "Unknown"
+                    
+                    // Get artist from second flex column
+                    val flexColumns = responsive.getAsJsonArray("flexColumns")
+                    val artistText = if (flexColumns != null && flexColumns.size() > 1) {
+                        val artistRuns = flexColumns.get(1)?.asJsonObject
+                            ?.getAsJsonObject("musicResponsiveListItemFlexColumnRenderer")
+                            ?.getAsJsonObject("text")
+                            ?.getAsJsonArray("runs")
+                        val sb = StringBuilder()
+                        artistRuns?.forEach { run ->
+                            sb.append(run.asJsonObject?.get("text")?.asString ?: "")
+                        }
+                        sb.toString()
+                    } else ""
+                    
+                    // Get thumbnail
+                    val thumbnailUrl = responsive.getAsJsonObject("thumbnail")
+                        ?.getAsJsonObject("musicThumbnailRenderer")
+                        ?.getAsJsonObject("thumbnail")
+                        ?.getAsJsonArray("thumbnails")
+                        ?.lastOrNull()?.asJsonObject
+                        ?.get("url")?.asString
+                    
+                    val song = SongItem(
+                        id = videoId,
+                        title = title,
+                        artistsText = artistText,
+                        thumbnailUrl = thumbnailUrl
+                    )
+                    
+                    // Add to quick picks or trending based on shelf title or size
+                    if (shelfTitle.contains("quick") || shelfTitle.contains("listen again") || quickPicks.size < 15) {
+                        if (quickPicks.none { it.id == videoId }) quickPicks.add(song)
+                    } else {
+                        if (trendingSongs.none { it.id == videoId }) trendingSongs.add(song)
+                    }
+                }
+            }
+            
+            twoRowItem?.let twoRowScope@ { twoRow ->
+                val title = twoRow.getAsJsonObject("title")
+                    ?.getAsJsonArray("runs")
+                    ?.firstOrNull()?.asJsonObject
+                    ?.get("text")?.asString ?: return@twoRowScope
+                
+                val navigationEndpoint = twoRow.getAsJsonObject("navigationEndpoint")
+                val watchEndpoint = navigationEndpoint?.getAsJsonObject("watchEndpoint")
+                val browseEndpoint = navigationEndpoint?.getAsJsonObject("browseEndpoint")
+                
+                val thumbnailUrl = twoRow.getAsJsonObject("thumbnailRenderer")
+                    ?.getAsJsonObject("musicThumbnailRenderer")
+                    ?.getAsJsonObject("thumbnail")
+                    ?.getAsJsonArray("thumbnails")
+                    ?.lastOrNull()?.asJsonObject
+                    ?.get("url")?.asString
+                
+                if (watchEndpoint != null) {
+                    val videoId = watchEndpoint.get("videoId")?.asString ?: return@twoRowScope
+                    val subtitle = twoRow.getAsJsonObject("subtitle")
+                        ?.getAsJsonArray("runs")
+                        ?.firstOrNull()?.asJsonObject
+                        ?.get("text")?.asString ?: ""
+                    
+                    val song = SongItem(
+                        id = videoId,
+                        title = title,
+                        artistsText = subtitle,
+                        thumbnailUrl = thumbnailUrl
+                    )
+                    
+                    if (shelfTitle.contains("trending") || shelfTitle.contains("charts")) {
+                        if (trendingSongs.none { it.id == videoId }) trendingSongs.add(song)
+                    } else if (quickPicks.size < 20) {
+                        if (quickPicks.none { it.id == videoId }) quickPicks.add(song)
+                    } else {
+                        if (trendingSongs.none { it.id == videoId }) trendingSongs.add(song)
+                    }
+                    
+                } else if (browseEndpoint != null) {
+                    val browseId = browseEndpoint.get("browseId")?.asString ?: return@twoRowScope
+                    val pageType = browseEndpoint.getAsJsonObject("browseEndpointContextSupportedConfigs")
+                        ?.getAsJsonObject("browseEndpointContextMusicConfig")
+                        ?.get("pageType")?.asString
+                    
+                    val subtitleRuns = twoRow.getAsJsonObject("subtitle")?.getAsJsonArray("runs")
+                    val subtitleBuilder = StringBuilder()
+                    subtitleRuns?.forEach { run ->
+                        subtitleBuilder.append(run.asJsonObject?.get("text")?.asString ?: "")
+                    }
+                    val subtitle = subtitleBuilder.toString()
+                    
+                    when (pageType) {
+                        "MUSIC_PAGE_TYPE_ALBUM" -> {
+                            if (newReleases.none { it.id == browseId }) {
+                                newReleases.add(AlbumItem(browseId, title, thumbnailUrl = thumbnailUrl))
+                            }
+                        }
+                        "MUSIC_PAGE_TYPE_PLAYLIST" -> {
+                            if (recommendedPlaylists.none { it.id == browseId }) {
+                                recommendedPlaylists.add(PlaylistItem(browseId, title, thumbnailUrl = thumbnailUrl))
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    private fun parseArtistPage(response: JsonObject, artistId: String): ArtistPage {
+        val songs = mutableListOf<SongItem>()
+        val albums = mutableListOf<AlbumItem>()
+        val singles = mutableListOf<AlbumItem>()
+        val similarArtists = mutableListOf<ArtistItem>()
+        
+        var artistName = ""
+        var description: String? = null
+        var thumbnailUrl: String? = null
+        var subscriberCount: String? = null
+        
+        try {
+            val header = response.getAsJsonObject("header")
+                ?.getAsJsonObject("musicImmersiveHeaderRenderer")
+                ?: response.getAsJsonObject("header")
+                    ?.getAsJsonObject("musicVisualHeaderRenderer")
+            
+            artistName = header?.getAsJsonObject("title")
+                ?.getAsJsonArray("runs")
+                ?.firstOrNull()?.asJsonObject
+                ?.get("text")?.asString ?: "Unknown Artist"
+            
+            thumbnailUrl = header?.getAsJsonObject("thumbnail")
+                ?.getAsJsonObject("musicThumbnailRenderer")
+                ?.getAsJsonObject("thumbnail")
+                ?.getAsJsonArray("thumbnails")
+                ?.lastOrNull()?.asJsonObject
+                ?.get("url")?.asString
+            
+            description = header?.getAsJsonObject("description")
+                ?.getAsJsonArray("runs")
+                ?.firstOrNull()?.asJsonObject
+                ?.get("text")?.asString
+            
+            subscriberCount = header?.getAsJsonObject("subscriptionButton")
+                ?.getAsJsonObject("subscribeButtonRenderer")
+                ?.get("subscriberCountText")?.asJsonObject
+                ?.getAsJsonArray("runs")
+                ?.firstOrNull()?.asJsonObject
+                ?.get("text")?.asString
+            
+            val contents = response.getAsJsonObject("contents")
+                ?.getAsJsonObject("singleColumnBrowseResultsRenderer")
+                ?.getAsJsonArray("tabs")
+                ?.firstOrNull()?.asJsonObject
+                ?.getAsJsonObject("tabRenderer")
+                ?.getAsJsonObject("content")
+                ?.getAsJsonObject("sectionListRenderer")
+                ?.getAsJsonArray("contents")
+            
+            contents?.forEach { section ->
+                val shelf = section.asJsonObject.getAsJsonObject("musicShelfRenderer")
+                    ?: section.asJsonObject.getAsJsonObject("musicCarouselShelfRenderer")
+                
+                shelf?.getAsJsonArray("contents")?.forEach { item ->
+                    parseMusicItem(item.asJsonObject.getAsJsonObject("musicResponsiveListItemRenderer")
+                        ?: item.asJsonObject.getAsJsonObject("musicTwoRowItemRenderer")
+                        ?: return@forEach)?.let { parsed ->
+                        when (parsed) {
+                            is SongItem -> songs.add(parsed)
+                            is AlbumItem -> albums.add(parsed)
+                        }
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+        
+        return ArtistPage(
+            artist = ArtistItem(artistId, artistName, thumbnailUrl, subscriberCount),
+            description = description,
+            thumbnailUrl = thumbnailUrl,
+            songs = songs,
+            albums = albums,
+            singles = singles,
+            similarArtists = similarArtists
+        )
+    }
+    
+    private fun parseAlbumPage(response: JsonObject, albumId: String): AlbumPage {
+        val songs = mutableListOf<SongItem>()
+        var albumTitle = ""
+        var artistName = ""
+        var artistId: String? = null
+        var year: Int? = null
+        var thumbnailUrl: String? = null
+        var description: String? = null
+        
+        try {
+            Log.d(TAG, "Parsing album page for: $albumId")
+            
+            // Try different header structures
+            val header = response.getAsJsonObject("header")
+                ?.getAsJsonObject("musicDetailHeaderRenderer")
+                ?: response.getAsJsonObject("header")
+                    ?.getAsJsonObject("musicImmersiveHeaderRenderer")
+            
+            albumTitle = header?.getAsJsonObject("title")
+                ?.getAsJsonArray("runs")
+                ?.firstOrNull()?.asJsonObject
+                ?.get("text")?.asString ?: "Unknown Album"
+            
+            val subtitleRuns = header?.getAsJsonObject("subtitle")?.getAsJsonArray("runs")
+            subtitleRuns?.forEach { run ->
+                val runObj = run.asJsonObject
+                val text = runObj.get("text")?.asString ?: return@forEach
+                
+                runObj.getAsJsonObject("navigationEndpoint")
+                    ?.getAsJsonObject("browseEndpoint")?.let { browse ->
+                        val pageType = browse.getAsJsonObject("browseEndpointContextSupportedConfigs")
+                            ?.getAsJsonObject("browseEndpointContextMusicConfig")
+                            ?.get("pageType")?.asString
+                        
+                        if (pageType == "MUSIC_PAGE_TYPE_ARTIST") {
+                            artistName = text
+                            artistId = browse.get("browseId")?.asString
+                        }
+                    }
+                
+                if (text.matches(Regex("\\d{4}"))) {
+                    year = text.toIntOrNull()
+                }
+            }
+            
+            // If artist name still empty, try to get from subtitleRuns without navigation
+            if (artistName.isEmpty()) {
+                artistName = subtitleRuns?.filter { run ->
+                    val text = run.asJsonObject?.get("text")?.asString ?: ""
+                    text.isNotBlank() && !text.matches(Regex("\\d{4}")) && text != " • " && text != "Album"
+                }?.firstOrNull()?.asJsonObject?.get("text")?.asString ?: "Unknown Artist"
+            }
+            
+            // Try multiple thumbnail locations
+            thumbnailUrl = header?.getAsJsonObject("thumbnail")
+                ?.getAsJsonObject("croppedSquareThumbnailRenderer")
+                ?.getAsJsonObject("thumbnail")
+                ?.getAsJsonArray("thumbnails")
+                ?.lastOrNull()?.asJsonObject
+                ?.get("url")?.asString
+                ?: header?.getAsJsonObject("thumbnail")
+                    ?.getAsJsonObject("musicThumbnailRenderer")
+                    ?.getAsJsonObject("thumbnail")
+                    ?.getAsJsonArray("thumbnails")
+                    ?.lastOrNull()?.asJsonObject
+                    ?.get("url")?.asString
+            
+            description = header?.getAsJsonObject("description")
+                ?.getAsJsonArray("runs")
+                ?.firstOrNull()?.asJsonObject
+                ?.get("text")?.asString
+            
+            // Try multiple content structures
+            // Structure 1: singleColumnBrowseResultsRenderer with musicShelfRenderer
+            var contents = response.getAsJsonObject("contents")
+                ?.getAsJsonObject("singleColumnBrowseResultsRenderer")
+                ?.getAsJsonArray("tabs")
+                ?.firstOrNull()?.asJsonObject
+                ?.getAsJsonObject("tabRenderer")
+                ?.getAsJsonObject("content")
+                ?.getAsJsonObject("sectionListRenderer")
+                ?.getAsJsonArray("contents")
+                ?.firstOrNull()?.asJsonObject
+                ?.getAsJsonObject("musicShelfRenderer")
+                ?.getAsJsonArray("contents")
+            
+            // Structure 2: twoColumnBrowseResultsRenderer
+            if (contents == null) {
+                contents = response.getAsJsonObject("contents")
+                    ?.getAsJsonObject("twoColumnBrowseResultsRenderer")
+                    ?.getAsJsonObject("secondaryContents")
+                    ?.getAsJsonObject("sectionListRenderer")
+                    ?.getAsJsonArray("contents")
+                    ?.firstOrNull()?.asJsonObject
+                    ?.getAsJsonObject("musicShelfRenderer")
+                    ?.getAsJsonArray("contents")
+                Log.d(TAG, "Using twoColumnBrowseResultsRenderer")
+            }
+            
+            // Structure 3: singleColumnBrowseResultsRenderer with musicPlaylistShelfRenderer
+            if (contents == null) {
+                contents = response.getAsJsonObject("contents")
+                    ?.getAsJsonObject("singleColumnBrowseResultsRenderer")
+                    ?.getAsJsonArray("tabs")
+                    ?.firstOrNull()?.asJsonObject
+                    ?.getAsJsonObject("tabRenderer")
+                    ?.getAsJsonObject("content")
+                    ?.getAsJsonObject("sectionListRenderer")
+                    ?.getAsJsonArray("contents")
+                    ?.firstOrNull()?.asJsonObject
+                    ?.getAsJsonObject("musicPlaylistShelfRenderer")
+                    ?.getAsJsonArray("contents")
+                Log.d(TAG, "Using musicPlaylistShelfRenderer")
+            }
+            
+            Log.d(TAG, "Found ${contents?.size() ?: 0} content items")
+            
+            contents?.forEachIndexed { index, item ->
+                val itemObj = item.asJsonObject.getAsJsonObject("musicResponsiveListItemRenderer")
+                    ?: return@forEachIndexed
+                
+                val flexColumns = itemObj.getAsJsonArray("flexColumns")
+                val songTitle = flexColumns?.firstOrNull()?.asJsonObject
+                    ?.getAsJsonObject("musicResponsiveListItemFlexColumnRenderer")
+                    ?.getAsJsonObject("text")
+                    ?.getAsJsonArray("runs")
+                    ?.firstOrNull()?.asJsonObject
+                    ?.get("text")?.asString ?: return@forEachIndexed
+                
+                // Try multiple ways to get videoId
+                var videoId = itemObj.getAsJsonObject("playlistItemData")
+                    ?.get("videoId")?.asString
+                
+                // Fallback: Get from overlay play button
+                if (videoId == null) {
+                    videoId = itemObj.getAsJsonObject("overlay")
+                        ?.getAsJsonObject("musicItemThumbnailOverlayRenderer")
+                        ?.getAsJsonObject("content")
+                        ?.getAsJsonObject("musicPlayButtonRenderer")
+                        ?.getAsJsonObject("playNavigationEndpoint")
+                        ?.getAsJsonObject("watchEndpoint")
+                        ?.get("videoId")?.asString
+                }
+                
+                // Fallback: Get from flexColumn navigation
+                if (videoId == null) {
+                    videoId = flexColumns?.firstOrNull()?.asJsonObject
+                        ?.getAsJsonObject("musicResponsiveListItemFlexColumnRenderer")
+                        ?.getAsJsonObject("text")
+                        ?.getAsJsonArray("runs")
+                        ?.firstOrNull()?.asJsonObject
+                        ?.getAsJsonObject("navigationEndpoint")
+                        ?.getAsJsonObject("watchEndpoint")
+                        ?.get("videoId")?.asString
+                }
+                
+                if (videoId == null) {
+                    Log.w(TAG, "Could not find videoId for track: $songTitle")
+                    return@forEachIndexed
+                }
+                
+                // Get song-specific artist if available
+                val songArtist = if (flexColumns != null && flexColumns.size() > 1) {
+                    val artistRuns = flexColumns.get(1)?.asJsonObject
+                        ?.getAsJsonObject("musicResponsiveListItemFlexColumnRenderer")
+                        ?.getAsJsonObject("text")
+                        ?.getAsJsonArray("runs")
+                    artistRuns?.mapNotNull { it.asJsonObject?.get("text")?.asString }
+                        ?.filter { it != " • " && it != " & " }
+                        ?.joinToString(", ") ?: artistName
+                } else artistName
+                
+                songs.add(SongItem(
+                    id = videoId,
+                    title = songTitle,
+                    artistsText = songArtist.ifEmpty { artistName },
+                    albumId = albumId,
+                    thumbnailUrl = thumbnailUrl
+                ))
+            }
+            
+            Log.d(TAG, "Parsed ${songs.size} songs from album $albumTitle")
+        } catch (e: Exception) {
+            Log.e(TAG, "Error parsing album page", e)
+            e.printStackTrace()
+        }
+        
+        return AlbumPage(
+            album = AlbumItem(
+                id = albumId,
+                title = albumTitle,
+                artists = listOf(ArtistItem(artistId ?: "", artistName)),
+                year = year,
+                thumbnailUrl = thumbnailUrl,
+                songCount = songs.size
+            ),
+            songs = songs,
+            description = description
+        )
+    }
+    
+    private fun parsePlaylistPage(response: JsonObject, playlistId: String): PlaylistPage {
+        val songs = mutableListOf<SongItem>()
+        var playlistTitle = ""
+        var author: String? = null
+        var thumbnailUrl: String? = null
+        var description: String? = null
+        var continuation: String? = null
+        
+        try {
+            val header = response.getAsJsonObject("header")
+                ?.getAsJsonObject("musicDetailHeaderRenderer")
+                ?: response.getAsJsonObject("header")
+                    ?.getAsJsonObject("musicEditablePlaylistDetailHeaderRenderer")
+                    ?.getAsJsonObject("header")
+                    ?.getAsJsonObject("musicDetailHeaderRenderer")
+            
+            playlistTitle = header?.getAsJsonObject("title")
+                ?.getAsJsonArray("runs")
+                ?.firstOrNull()?.asJsonObject
+                ?.get("text")?.asString ?: "Unknown Playlist"
+            
+            author = header?.getAsJsonObject("subtitle")
+                ?.getAsJsonArray("runs")
+                ?.firstOrNull()?.asJsonObject
+                ?.get("text")?.asString
+            
+            thumbnailUrl = header?.getAsJsonObject("thumbnail")
+                ?.getAsJsonObject("croppedSquareThumbnailRenderer")
+                ?.getAsJsonObject("thumbnail")
+                ?.getAsJsonArray("thumbnails")
+                ?.lastOrNull()?.asJsonObject
+                ?.get("url")?.asString
+            
+            description = header?.getAsJsonObject("description")
+                ?.getAsJsonArray("runs")
+                ?.firstOrNull()?.asJsonObject
+                ?.get("text")?.asString
+            
+            val contents = response.getAsJsonObject("contents")
+                ?.getAsJsonObject("singleColumnBrowseResultsRenderer")
+                ?.getAsJsonArray("tabs")
+                ?.firstOrNull()?.asJsonObject
+                ?.getAsJsonObject("tabRenderer")
+                ?.getAsJsonObject("content")
+                ?.getAsJsonObject("sectionListRenderer")
+                ?.getAsJsonArray("contents")
+                ?.firstOrNull()?.asJsonObject
+                ?.getAsJsonObject("musicPlaylistShelfRenderer")
+                ?: response.getAsJsonObject("contents")
+                    ?.getAsJsonObject("singleColumnBrowseResultsRenderer")
+                    ?.getAsJsonArray("tabs")
+                    ?.firstOrNull()?.asJsonObject
+                    ?.getAsJsonObject("tabRenderer")
+                    ?.getAsJsonObject("content")
+                    ?.getAsJsonObject("sectionListRenderer")
+                    ?.getAsJsonArray("contents")
+                    ?.firstOrNull()?.asJsonObject
+                    ?.getAsJsonObject("musicShelfRenderer")
+            
+            contents?.getAsJsonArray("contents")?.forEach { item ->
+                val itemObj = item.asJsonObject.getAsJsonObject("musicResponsiveListItemRenderer")
+                    ?: return@forEach
+                
+                val flexColumns = itemObj.getAsJsonArray("flexColumns")
+                val songTitle = flexColumns?.firstOrNull()?.asJsonObject
+                    ?.getAsJsonObject("musicResponsiveListItemFlexColumnRenderer")
+                    ?.getAsJsonObject("text")
+                    ?.getAsJsonArray("runs")
+                    ?.firstOrNull()?.asJsonObject
+                    ?.get("text")?.asString ?: return@forEach
+                
+                val artistText = if (flexColumns != null && flexColumns.size() > 1) {
+                    flexColumns.get(1)?.asJsonObject
+                    ?.getAsJsonObject("musicResponsiveListItemFlexColumnRenderer")
+                    ?.getAsJsonObject("text")
+                    ?.getAsJsonArray("runs")
+                    ?.firstOrNull()?.asJsonObject
+                    ?.get("text")?.asString ?: ""
+                } else ""
+                
+                val playlistItemData = itemObj.getAsJsonObject("playlistItemData")
+                val videoId = playlistItemData?.get("videoId")?.asString ?: return@forEach
+                
+                val songThumbnail = itemObj.getAsJsonObject("thumbnail")
+                    ?.getAsJsonObject("musicThumbnailRenderer")
+                    ?.getAsJsonObject("thumbnail")
+                    ?.getAsJsonArray("thumbnails")
+                    ?.lastOrNull()?.asJsonObject
+                    ?.get("url")?.asString
+                
+                songs.add(SongItem(
+                    id = videoId,
+                    title = songTitle,
+                    artistsText = artistText,
+                    thumbnailUrl = songThumbnail
+                ))
+            }
+            
+            continuation = contents?.getAsJsonArray("continuations")
+                ?.firstOrNull()?.asJsonObject
+                ?.getAsJsonObject("nextContinuationData")
+                ?.get("continuation")?.asString
+                
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+        
+        return PlaylistPage(
+            playlist = PlaylistItem(
+                id = playlistId,
+                title = playlistTitle,
+                author = author,
+                thumbnailUrl = thumbnailUrl,
+                songCount = songs.size
+            ),
+            songs = songs,
+            description = description,
+            continuation = continuation
+        )
+    }
+    
+    private fun parseStreamUrl(response: JsonObject): String? {
+        return try {
+            val streamingData = response.getAsJsonObject("streamingData")
+            if (streamingData == null) {
+                Log.w(TAG, "No streamingData in response")
+                return null
+            }
+
+            val hlsManifestUrl = streamingData.get("hlsManifestUrl")?.asString
+            val dashManifestUrl = streamingData.get("dashManifestUrl")?.asString
+            
+            val formatCandidates = mutableListOf<JsonObject>()
+            streamingData.getAsJsonArray("adaptiveFormats")?.forEach { format ->
+                if (format.isJsonObject) {
+                    formatCandidates.add(format.asJsonObject)
+                }
+            }
+            streamingData.getAsJsonArray("formats")?.forEach { format ->
+                if (format.isJsonObject) {
+                    formatCandidates.add(format.asJsonObject)
+                }
+            }
+
+            if (formatCandidates.isEmpty()) {
+                if (isUsableStreamUrl(hlsManifestUrl)) {
+                    Log.d(TAG, "Using HLS manifest fallback")
+                    return hlsManifestUrl
+                }
+
+                if (isUsableStreamUrl(dashManifestUrl)) {
+                    Log.d(TAG, "Using DASH manifest fallback")
+                    return dashManifestUrl
+                }
+
+                Log.w(TAG, "No adaptive formats, formats, or manifests in streamingData")
+                return null
+            }
+
+            Log.d(TAG, "Found ${formatCandidates.size} stream format candidates")
+
+            var bestAudioUrl: String? = null
+            var highestBitrate = 0
+            
+            formatCandidates.forEach { formatObj ->
+                val mimeType = formatObj.get("mimeType")?.asString ?: return@forEach
+                
+                if (mimeType.contains("audio")) {
+                    val bitrate = formatObj.get("averageBitrate")?.asInt
+                        ?: formatObj.get("bitrate")?.asInt ?: 0
+                    
+                    var url = formatObj.get("url")?.asString
+
+                    if (url == null) {
+                        val signatureCipher = formatObj.get("signatureCipher")?.asString
+                            ?: formatObj.get("cipher")?.asString
+                        if (signatureCipher != null) {
+                            url = parseSignatureCipher(signatureCipher)
+                        }
+                    }
+
+                    if (isUsableStreamUrl(url) && bitrate >= highestBitrate) {
+                        highestBitrate = bitrate
+                        bestAudioUrl = url
+                        Log.d(TAG, "Found audio format: $mimeType, bitrate: $bitrate")
+                    }
+                }
+            }
+            
+            if (bestAudioUrl == null) {
+                if (isUsableStreamUrl(hlsManifestUrl)) {
+                    Log.d(TAG, "Using HLS manifest after audio format scan")
+                    return hlsManifestUrl
+                }
+                if (isUsableStreamUrl(dashManifestUrl)) {
+                    Log.d(TAG, "Using DASH manifest after audio format scan")
+                    return dashManifestUrl
+                }
+                Log.w(TAG, "No playable audio URL found in formats")
+            }
+            
+            bestAudioUrl
+        } catch (e: Exception) {
+            Log.e(TAG, "Error parsing stream URL", e)
+            null
+        }
+    }
+
+    private data class PlayerClientConfig(
+        val apiKey: String,
+        val headerClientName: String,
+        val clientVersion: String,
+        val userAgent: String,
+        val origin: String,
+        val referer: String
+    )
+
+    private fun resolvePlayerClientConfig(context: JsonObject): PlayerClientConfig {
+        val clientName = context.getAsJsonObject("client")
+            ?.get("clientName")
+            ?.asString
+            ?.uppercase()
+            .orEmpty()
+
+        return when {
+            clientName.contains("IOS") -> PlayerClientConfig(
+                apiKey = InnerTubeApi.IOS_API_KEY,
+                headerClientName = "IOS",
+                clientVersion = "19.29.1",
+                userAgent = "com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;)",
+                origin = "https://music.youtube.com",
+                referer = "https://music.youtube.com/"
+            )
+            clientName.contains("TVHTML5") -> PlayerClientConfig(
+                apiKey = InnerTubeApi.TVHTML5_API_KEY,
+                headerClientName = "TVHTML5_SIMPLY_EMBEDDED_PLAYER",
+                clientVersion = "2.0",
+                userAgent = "Mozilla/5.0 (PlayStation 4 5.55) AppleWebKit/601.2 (KHTML, like Gecko)",
+                origin = "https://www.youtube.com",
+                referer = "https://www.youtube.com/"
+            )
+            clientName.contains("ANDROID_VR") -> PlayerClientConfig(
+                apiKey = InnerTubeApi.ANDROID_MUSIC_API_KEY,
+                headerClientName = "ANDROID_VR",
+                clientVersion = "1.61.48",
+                userAgent = "com.google.android.apps.youtube.vr.oculus/1.61.48 (Linux; U; Android 12; en_US; Oculus Quest 3)",
+                origin = "https://music.youtube.com",
+                referer = "https://music.youtube.com/"
+            )
+            clientName.contains("ANDROID_MUSIC") -> PlayerClientConfig(
+                apiKey = InnerTubeApi.ANDROID_MUSIC_API_KEY,
+                headerClientName = "ANDROID_MUSIC",
+                clientVersion = "5.01",
+                userAgent = InnerTubeApi.ANDROID_USER_AGENT,
+                origin = "https://music.youtube.com",
+                referer = "https://music.youtube.com/"
+            )
+            clientName.contains("ANDROID") -> PlayerClientConfig(
+                apiKey = InnerTubeApi.ANDROID_MUSIC_API_KEY,
+                headerClientName = "ANDROID",
+                clientVersion = "20.10.38",
+                userAgent = "com.google.android.youtube/20.10.38 (Linux; U; Android 11) gzip",
+                origin = "https://music.youtube.com",
+                referer = "https://music.youtube.com/"
+            )
+            clientName.contains("WEB_CREATOR") -> PlayerClientConfig(
+                apiKey = InnerTubeApi.WEB_REMIX_API_KEY,
+                headerClientName = "WEB_CREATOR",
+                clientVersion = "1.20250312.03.01",
+                userAgent = InnerTubeApi.WEB_USER_AGENT,
+                origin = "https://music.youtube.com",
+                referer = "https://music.youtube.com/"
+            )
+            clientName.contains("WEB_REMIX") || clientName.contains("WEB") -> PlayerClientConfig(
+                apiKey = InnerTubeApi.WEB_REMIX_API_KEY,
+                headerClientName = "WEB_REMIX",
+                clientVersion = InnerTubeApi.CLIENT_VERSION,
+                userAgent = InnerTubeApi.WEB_USER_AGENT,
+                origin = "https://music.youtube.com",
+                referer = "https://music.youtube.com/"
+            )
+            else -> PlayerClientConfig(
+                apiKey = InnerTubeApi.ANDROID_MUSIC_API_KEY,
+                headerClientName = "ANDROID_MUSIC",
+                clientVersion = "5.01",
+                userAgent = InnerTubeApi.ANDROID_USER_AGENT,
+                origin = "https://music.youtube.com",
+                referer = "https://music.youtube.com/"
+            )
+        }
+    }
+
+    private fun isUsableStreamUrl(url: String?): Boolean {
+        if (url.isNullOrBlank()) return false
+
+        val normalized = url.trim()
+        if (!(normalized.startsWith("https://") || normalized.startsWith("http://"))) {
+            return false
+        }
+
+        val expire = extractExpireTimestamp(normalized)
+        if (expire != null && expire <= (System.currentTimeMillis() / 1000L) + 60L) {
+            return false
+        }
+
+        return true
+    }
+
+    private fun extractExpireTimestamp(url: String): Long? {
+        val query = url.substringAfter('?', "")
+        if (query.isBlank()) return null
+
+        query.split('&').forEach { param ->
+            val pair = param.split('=', limit = 2)
+            if (pair.size != 2) return@forEach
+            if (pair[0] == "expire") {
+                return pair[1].toLongOrNull()
+            }
+        }
+
+        return null
+    }
+
+    private fun parseSignatureCipher(signatureCipher: String): String? {
+        val params = signatureCipher
+            .split("&")
+            .mapNotNull { part ->
+                val split = part.split("=", limit = 2)
+                if (split.size != 2) null else split[0] to URLDecoder.decode(split[1], "UTF-8")
+            }
+            .toMap()
+
+        val url = params["url"] ?: return null
+        val signature = params["sig"] ?: params["signature"]
+        val signatureParam = params["sp"] ?: "signature"
+
+        if (!signature.isNullOrBlank()) {
+            return appendQueryParameter(url, signatureParam, signature)
+        }
+
+        val obfuscatedSignature = params["s"]
+        if (!obfuscatedSignature.isNullOrBlank()) {
+            val decipheredSignature = decipherSignature(obfuscatedSignature)
+            if (!decipheredSignature.isNullOrBlank()) {
+                return appendQueryParameter(url, signatureParam, decipheredSignature)
+            }
+
+            Log.w(TAG, "Cipher has obfuscated signature (s), but no decipher plan is available")
+            return null
+        }
+
+        return url
+    }
+
+    private fun appendQueryParameter(url: String, key: String, value: String): String {
+        val separator = if (url.contains("?")) "&" else "?"
+        return "$url$separator${URLEncoder.encode(key, "UTF-8")}=${URLEncoder.encode(value, "UTF-8")}"
+    }
+
+    private class NewPipeOkHttpDownloader(
+        private val httpClient: okhttp3.OkHttpClient
+    ) : Downloader() {
+
+        @Throws(IOException::class, ReCaptchaException::class)
+        override fun execute(request: Request): Response {
+            val method = request.httpMethod().uppercase()
+            val headers = request.headers()
+
+            val requestBuilder = okhttp3.Request.Builder()
+                .url(request.url())
+
+            headers?.forEach { (name, values) ->
+                values.forEach { value ->
+                    requestBuilder.addHeader(name, value)
+                }
+            }
+
+            if (headers.isNullOrEmpty() || headers.keys.none { key -> key.equals("User-Agent", ignoreCase = true) }) {
+                requestBuilder.header("User-Agent", InnerTubeApi.WEB_USER_AGENT)
+            }
+
+            val requestBody = when (method) {
+                "POST", "PUT", "PATCH" -> {
+                    val contentTypeHeader = headers
+                        ?.entries
+                        ?.firstOrNull { entry -> entry.key.equals("Content-Type", ignoreCase = true) }
+                        ?.value
+                        ?.firstOrNull()
+                    val mediaType = contentTypeHeader?.toMediaTypeOrNull()
+                    (request.dataToSend() ?: ByteArray(0)).toRequestBody(mediaType)
+                }
+                else -> null
+            }
+
+            requestBuilder.method(method, requestBody)
+
+            httpClient.newCall(requestBuilder.build()).execute().use { response ->
+                val responseBody = if (method == "HEAD") "" else response.body?.string().orEmpty()
+                if (response.code == 429 || responseBody.contains("recaptcha", ignoreCase = true)) {
+                    throw ReCaptchaException("ReCaptcha challenge detected", request.url())
+                }
+
+                val responseHeaders = response.headers.names().associateWith { name ->
+                    response.headers.values(name)
+                }
+
+                return Response(
+                    response.code,
+                    response.message.ifBlank { "" },
+                    responseHeaders,
+                    responseBody,
+                    response.request.url.toString()
+                )
+            }
+        }
+    }
+    
+    private fun parseRelatedSongs(response: JsonObject): List<SongItem> {
+        val songs = mutableListOf<SongItem>()
+        
+        try {
+            val tabs = response.getAsJsonObject("contents")
+                ?.getAsJsonObject("singleColumnMusicWatchNextResultsRenderer")
+                ?.getAsJsonObject("tabbedRenderer")
+                ?.getAsJsonObject("watchNextTabbedResultsRenderer")
+                ?.getAsJsonArray("tabs")
+            
+            val contents = if (tabs != null && tabs.size() > 1) {
+                tabs.get(1)?.asJsonObject
+                    ?.getAsJsonObject("tabRenderer")
+                    ?.getAsJsonObject("content")
+                    ?.getAsJsonObject("musicQueueRenderer")
+                    ?.getAsJsonObject("content")
+                    ?.getAsJsonObject("playlistPanelRenderer")
+                    ?.getAsJsonArray("contents")
+            } else null
+            
+            contents?.forEach { item ->
+                val itemObj = item.asJsonObject.getAsJsonObject("playlistPanelVideoRenderer")
+                    ?: return@forEach
+                
+                val videoId = itemObj.get("videoId")?.asString ?: return@forEach
+                
+                val title = itemObj.getAsJsonObject("title")
+                    ?.getAsJsonArray("runs")
+                    ?.firstOrNull()?.asJsonObject
+                    ?.get("text")?.asString ?: return@forEach
+                
+                val artistText = itemObj.getAsJsonObject("shortBylineText")
+                    ?.getAsJsonArray("runs")
+                    ?.firstOrNull()?.asJsonObject
+                    ?.get("text")?.asString ?: ""
+                
+                val thumbnailUrl = itemObj.getAsJsonObject("thumbnail")
+                    ?.getAsJsonArray("thumbnails")
+                    ?.lastOrNull()?.asJsonObject
+                    ?.get("url")?.asString
+                
+                songs.add(SongItem(
+                    id = videoId,
+                    title = title,
+                    artistsText = artistText,
+                    thumbnailUrl = thumbnailUrl
+                ))
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+        
+        return songs
+    }
+    
+    private fun getGreeting(): String {
+        val hour = java.util.Calendar.getInstance().get(java.util.Calendar.HOUR_OF_DAY)
+        return when {
+            hour < 12 -> "Good morning"
+            hour < 18 -> "Good afternoon"
+            else -> "Good evening"
+        }
+    }
+    
+    // Playlist continuation
+    suspend fun getPlaylistContinuation(playlistId: String, continuation: String): Result<PlaylistContinuation> = 
+        withContext(Dispatchers.IO) {
+            try {
+                val body = JsonObject().apply {
+                    addProperty("continuation", continuation)
+                    add("context", createContext())
+                }
+                
+                val response = innerTubeApi.browse(body)
+                val songs = mutableListOf<SongItem>()
+                var nextContinuation: String? = null
+                
+                // Parse continuation response
+                val continuationContents = response.getAsJsonObject("continuationContents")
+                    ?.getAsJsonObject("musicPlaylistShelfContinuation")
+                
+                continuationContents?.getAsJsonArray("contents")?.forEach { item ->
+                    parseMusicItem(item.asJsonObject)?.let { parsed ->
+                        if (parsed is SongItem) songs.add(parsed)
+                    }
+                }
+                
+                nextContinuation = continuationContents?.getAsJsonArray("continuations")
+                    ?.firstOrNull()?.asJsonObject
+                    ?.getAsJsonObject("nextContinuationData")
+                    ?.get("continuation")?.asString
+                
+                Result.success(PlaylistContinuation(songs, nextContinuation))
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    
+    // Local playlists
+    fun getLocalPlaylists(): Flow<List<LocalPlaylist>> = songDao.getLocalPlaylists()
+    
+    suspend fun createLocalPlaylist(name: String) {
+        songDao.createPlaylist(
+            com.beatloop.music.data.database.PlaylistEntity(
+                name = name,
+                createdAt = System.currentTimeMillis()
+            )
+        )
+    }
+    
+    suspend fun deleteLocalPlaylist(playlistId: Long) = songDao.deletePlaylist(playlistId)
+    
+    suspend fun renameLocalPlaylist(playlistId: Long, name: String) = 
+        songDao.updatePlaylistName(playlistId, name)
+    
+    fun getLocalPlaylistWithSongs(playlistId: Long): Flow<LocalPlaylistWithSongs?> = 
+        songDao.getPlaylistWithSongs(playlistId)
+    
+    suspend fun addSongToPlaylist(playlistId: Long, songId: String) {
+        songDao.addSongToPlaylist(playlistId, songId)
+    }
+    
+    suspend fun addSongToPlaylist(playlistId: Long, song: SongItem) {
+        saveSong(song)
+        songDao.addSongToPlaylist(playlistId, song.id)
+    }
+    
+    suspend fun removeSongFromPlaylist(playlistId: Long, songId: String) {
+        songDao.removeSongFromPlaylist(playlistId, songId)
+    }
+    
+    // Save song to database (required before like/playlist operations)
+    suspend fun saveSong(song: SongItem) {
+        val existing = songDao.getSongById(song.id)
+        if (existing == null) {
+            songDao.insert(
+                Song(
+                    id = song.id,
+                    title = song.title,
+                    artistsText = song.artistsText,
+                    albumId = song.albumId,
+                    thumbnailUrl = song.thumbnailUrl,
+                    duration = song.duration ?: 0L
+                )
+            )
+        }
+    }
+    
+    // Downloaded songs
+    fun getDownloadedSongs(): Flow<List<SongItem>> = songDao.getDownloadedSongs()
+
+    suspend fun getDownloadedSong(songId: String) = downloadedSongDao.getDownload(songId)
+
+    suspend fun setSongDownloadState(songId: String, state: DownloadState, localPath: String? = null) {
+        songDao.updateDownloadState(songId, state, localPath)
+    }
+    
+    suspend fun deleteDownload(songId: String) = withContext(Dispatchers.IO) {
+        downloadedSongDao.getDownload(songId)?.let { download ->
+            runCatching { File(download.filePath).delete() }
+            download.thumbnailPath?.let { path ->
+                runCatching { File(path).delete() }
+            }
+            downloadedSongDao.deleteById(songId)
+        }
+
+        songDao.updateDownloadState(songId, DownloadState.NOT_DOWNLOADED, null)
+        // Legacy cleanup for previous DB writes routed via SongDao.
+        songDao.deleteDownload(songId)
+    }
+    
+    // Play history
+    fun getPlayHistory(): Flow<List<SongItem>> = songDao.getPlayHistory()
+
+    suspend fun recordPlayback(
+        songId: String,
+        title: String,
+        artist: String,
+        thumbnailUrl: String? = null
+    ) {
+        val now = System.currentTimeMillis()
+        saveSong(
+            SongItem(
+                id = songId,
+                title = title,
+                artistsText = artist,
+                thumbnailUrl = thumbnailUrl
+            )
+        )
+        songDao.incrementPlayCount(songId, now)
+        songDao.addToPlayHistory(
+            com.beatloop.music.data.database.PlayHistoryEntry(
+                songId = songId,
+                playedAt = now
+            )
+        )
+    }
+    
+    suspend fun addToPlayHistory(song: SongItem) {
+        saveSong(song)
+        songDao.addToPlayHistory(
+            com.beatloop.music.data.database.PlayHistoryEntry(
+                songId = song.id,
+                playedAt = System.currentTimeMillis()
+            )
+        )
+    }
+    
+    suspend fun clearPlayHistory() = songDao.clearPlayHistory()
+    
+    // Liked songs
+    fun getLikedSongs(): Flow<List<SongItem>> = songDao.getLikedSongs()
+    
+    suspend fun likeSong(songId: String) = songDao.likeSong(songId)
+    
+    suspend fun likeSong(song: SongItem) {
+        saveSong(song)
+        songDao.likeSong(song.id)
+    }
+    
+    suspend fun unlikeSong(songId: String) = songDao.unlikeSong(songId)
+    
+    suspend fun isSongLiked(songId: String): Boolean = songDao.isSongLiked(songId)
+}

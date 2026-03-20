@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    
+    <!-- Sound wave 1 -->
+    <path
+        android:fillColor="#121212"
+        android:pathData="M33,42 L33,66 C33,67.66 31.66,69 30,69 C28.34,69 27,67.66 27,66 L27,42 C27,40.34 28.34,39 30,39 C31.66,39 33,40.34 33,42 Z" />
+    
+    <!-- Sound wave 2 -->
+    <path
+        android:fillColor="#121212"
+        android:pathData="M45,33 L45,75 C45,76.66 43.66,78 42,78 C40.34,78 39,76.66 39,75 L39,33 C39,31.34 40.34,30 42,30 C43.66,30 45,31.34 45,33 Z" />
+    
+    <!-- Sound wave 3 (center) -->
+    <path
+        android:fillColor="#121212"
+        android:pathData="M57,27 L57,81 C57,82.66 55.66,84 54,84 C52.34,84 51,82.66 51,81 L51,27 C51,25.34 52.34,24 54,24 C55.66,24 57,25.34 57,27 Z" />
+    
+    <!-- Sound wave 4 -->
+    <path
+        android:fillColor="#121212"
+        android:pathData="M69,36 L69,72 C69,73.66 67.66,75 66,75 C64.34,75 63,73.66 63,72 L63,36 C63,34.34 64.34,33 66,33 C67.66,33 69,34.34 69,36 Z" />
+    
+    <!-- Sound wave 5 -->
+    <path
+        android:fillColor="#121212"
+        android:pathData="M81,45 L81,63 C81,64.66 79.66,66 78,66 C76.34,66 75,64.66 75,63 L75,45 C75,43.34 76.34,42 78,42 C79.66,42 81,43.34 81,45 Z" />
+    
+</vector>

@@ -1,0 +1,149 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Beatloop</string>
+    <string name="app_description">Free Music Streaming</string>
+    
+    <!-- Navigation -->
+    <string name="nav_home">Home</string>
+    <string name="nav_search">Search</string>
+    <string name="nav_library">Library</string>
+    <string name="nav_settings">Settings</string>
+    
+    <!-- Home Screen -->
+    <string name="welcome_message">Good %1$s</string>
+    <string name="morning">morning</string>
+    <string name="afternoon">afternoon</string>
+    <string name="evening">evening</string>
+    <string name="quick_picks">Quick Picks</string>
+    <string name="recently_played">Recently Played</string>
+    <string name="trending_songs">Trending Songs</string>
+    <string name="recommended_for_you">Recommended for You</string>
+    <string name="new_releases">New Releases</string>
+    <string name="top_charts">Top Charts</string>
+    <string name="moods_and_genres">Moods &amp; Genres</string>
+    
+    <!-- Search -->
+    <string name="search_hint">Search songs, artists, albums…</string>
+    <string name="search_history">Search History</string>
+    <string name="clear_search_history">Clear History</string>
+    <string name="search_suggestions">Suggestions</string>
+    <string name="songs">Songs</string>
+    <string name="artists">Artists</string>
+    <string name="albums">Albums</string>
+    <string name="playlists">Playlists</string>
+    <string name="videos">Videos</string>
+    
+    <!-- Library -->
+    <string name="my_library">My Library</string>
+    <string name="liked_songs">Liked Songs</string>
+    <string name="downloads">Downloads</string>
+    <string name="history">History</string>
+    <string name="local_songs">Local Songs</string>
+    <string name="create_playlist">Create Playlist</string>
+    <string name="playlist_name">Playlist Name</string>
+    <string name="playlist_description">Description (optional)</string>
+    
+    <!-- Player -->
+    <string name="now_playing">Now Playing</string>
+    <string name="lyrics">Lyrics</string>
+    <string name="no_lyrics_available">No lyrics available</string>
+    <string name="queue">Queue</string>
+    <string name="add_to_queue">Add to Queue</string>
+    <string name="play_next">Play Next</string>
+    <string name="shuffle">Shuffle</string>
+    <string name="repeat">Repeat</string>
+    <string name="repeat_one">Repeat One</string>
+    <string name="sleep_timer">Sleep Timer</string>
+    <string name="equalizer">Equalizer</string>
+    
+    <!-- Downloads -->
+    <string name="download">Download</string>
+    <string name="downloading">Downloading…</string>
+    <string name="downloaded">Downloaded</string>
+    <string name="download_failed">Download Failed</string>
+    <string name="remove_download">Remove Download</string>
+    <string name="download_quality">Download Quality</string>
+    <string name="storage_location">Storage Location</string>
+    
+    <!-- Settings -->
+    <string name="appearance">Appearance</string>
+    <string name="theme">Theme</string>
+    <string name="theme_system">System Default</string>
+    <string name="theme_light">Light</string>
+    <string name="theme_dark">Dark</string>
+    <string name="theme_amoled">AMOLED Black</string>
+    <string name="dynamic_colors">Dynamic Colors</string>
+    <string name="playback">Playback</string>
+    <string name="audio_quality">Audio Quality</string>
+    <string name="audio_quality_low">Low (128kbps)</string>
+    <string name="audio_quality_medium">Medium (192kbps)</string>
+    <string name="audio_quality_high">High (256kbps)</string>
+    <string name="audio_quality_best">Best (320kbps)</string>
+    <string name="skip_silence">Skip Silence</string>
+    <string name="audio_normalization">Audio Normalization</string>
+    <string name="sponsor_block">SponsorBlock</string>
+    <string name="sponsor_block_description">Skip sponsors and promotions</string>
+    <string name="skip_sponsor">Skip Sponsors</string>
+    <string name="skip_intro">Skip Intros</string>
+    <string name="skip_outro">Skip Outros</string>
+    <string name="skip_self_promo">Skip Self Promotion</string>
+    <string name="content_settings">Content</string>
+    <string name="content_language">Content Language</string>
+    <string name="content_country">Content Country</string>
+    <string name="cache_settings">Cache</string>
+    <string name="cache_size">Max Cache Size</string>
+    <string name="clear_cache">Clear Cache</string>
+    <string name="about">About</string>
+    <string name="version">Version</string>
+    <string name="licenses">Open Source Licenses</string>
+    <string name="privacy_policy">Privacy Policy</string>
+    
+    <!-- Actions -->
+    <string name="play">Play</string>
+    <string name="pause">Pause</string>
+    <string name="previous">Previous</string>
+    <string name="next">Next</string>
+    <string name="like">Like</string>
+    <string name="unlike">Unlike</string>
+    <string name="share">Share</string>
+    <string name="add_to_playlist">Add to Playlist</string>
+    <string name="go_to_artist">Go to Artist</string>
+    <string name="go_to_album">Go to Album</string>
+    <string name="view_all">View All</string>
+    <string name="cancel">Cancel</string>
+    <string name="ok">OK</string>
+    <string name="save">Save</string>
+    <string name="delete">Delete</string>
+    <string name="edit">Edit</string>
+    <string name="retry">Retry</string>
+    
+    <!-- Errors -->
+    <string name="error_generic">Something went wrong</string>
+    <string name="error_network">Network error. Check your connection.</string>
+    <string name="error_playback">Playback error occurred</string>
+    <string name="error_no_results">No results found</string>
+    <string name="error_loading">Error loading content</string>
+    
+    <!-- Notifications -->
+    <string name="playback_channel_name">Playback</string>
+    <string name="playback_channel_description">Music playback controls</string>
+    <string name="download_channel_name">Downloads</string>
+    <string name="download_channel_description">Download progress notifications</string>
+    <string name="widget_description">Playback controls with track details</string>
+    <string name="quick_tile_label">Beatloop Controls</string>
+    
+    <!-- Time Durations -->
+    <string name="minutes">%1$d min</string>
+    <string name="hours">%1$d hr</string>
+    <string name="songs_count">%1$d songs</string>
+    
+    <!-- Empty States -->
+    <string name="empty_liked_songs">No liked songs yet</string>
+    <string name="empty_liked_songs_desc">Start liking songs to see them here</string>
+    <string name="empty_downloads">No downloads yet</string>
+    <string name="empty_downloads_desc">Download songs to listen offline</string>
+    <string name="empty_history">No listening history</string>
+    <string name="empty_history_desc">Songs you listen to will appear here</string>
+    <string name="empty_playlists">No playlists yet</string>
+    <string name="empty_playlists_desc">Create a playlist to get started</string>
+</resources>
