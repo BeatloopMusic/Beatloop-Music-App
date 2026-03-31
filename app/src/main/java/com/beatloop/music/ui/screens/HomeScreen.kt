@@ -56,6 +56,8 @@ fun HomeScreen(
     
     val playlists by songActionsViewModel.playlists.collectAsState()
     val likedSongIds by songActionsViewModel.likedSongIds.collectAsState()
+    val downloadedSongIds by songActionsViewModel.downloadedSongIds.collectAsState()
+    val downloadUiStateMap by songActionsViewModel.downloadUiStateMap.collectAsState()
 
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner) {
@@ -76,6 +78,11 @@ fun HomeScreen(
         SongOptionsBottomSheet(
             song = selectedSong!!,
             isLiked = likedSongIds.contains(selectedSong!!.id),
+            isDownloaded = downloadedSongIds.contains(selectedSong!!.id),
+            downloadProgress = downloadUiStateMap[selectedSong!!.id]
+                ?.takeIf { it.state == com.beatloop.music.data.model.DownloadState.DOWNLOADING }
+                ?.progress,
+            downloadSizeBytes = downloadUiStateMap[selectedSong!!.id]?.fileSizeBytes,
             onDismiss = { showSongOptions = false },
             onPlayNext = {
                 playerConnection?.addMediaItemNext(
@@ -108,9 +115,15 @@ fun HomeScreen(
             },
             onDownload = {
                 selectedSong?.let(songActionsViewModel::downloadSong)
+                navController.navigate(Screen.Downloads.route)
                 showSongOptions = false
             },
-            onGoToArtist = { /* TODO: Navigate to artist */ },
+            onGoToArtist = {
+                selectedSong?.artistId?.let { artistId ->
+                    navController.navigate(Screen.Artist.createRoute(artistId))
+                }
+                showSongOptions = false
+            },
             onGoToAlbum = {
                 selectedSong!!.albumId?.let { albumId ->
                     navController.navigate(Screen.Album.createRoute(albumId))
@@ -132,7 +145,7 @@ fun HomeScreen(
                 showCreatePlaylist = true
             },
             onSelectPlaylist = { playlistId ->
-                songActionsViewModel.addToPlaylist(playlistId, selectedSong!!)
+                songActionsViewModel.addToPlaylist(playlistId, selectedSong!!, context)
             }
         )
     }
@@ -155,7 +168,7 @@ fun HomeScreen(
                 TextButton(
                     onClick = {
                         if (playlistName.isNotBlank()) {
-                            songActionsViewModel.createPlaylistAndAddSong(playlistName, selectedSong!!)
+                            songActionsViewModel.createPlaylistAndAddSong(playlistName, selectedSong!!, context)
                             showCreatePlaylist = false
                         }
                     },
@@ -576,7 +589,8 @@ private fun SectionHeader(
             text = title,
             style = MaterialTheme.typography.titleLarge,
             fontWeight = FontWeight.Bold,
-            color = MaterialTheme.colorScheme.onBackground
+            color = MaterialTheme.colorScheme.onBackground,
+            modifier = Modifier.weight(1f) // Fixes overlapping text
         )
         onViewAll?.let {
             TextButton(

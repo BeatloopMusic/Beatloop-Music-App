@@ -23,6 +23,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
@@ -31,17 +32,27 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
+import androidx.core.graphics.drawable.toBitmap
+import androidx.core.net.toUri
 import androidx.hilt.navigation.compose.hiltViewModel
+import androidx.palette.graphics.Palette
+import androidx.media3.common.MediaMetadata
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
+import androidx.media3.ui.PlayerView
 import androidx.navigation.NavController
 import coil.compose.AsyncImage
+import coil.imageLoader
+import coil.request.ImageRequest
 import com.beatloop.music.data.model.SongItem
+import com.beatloop.music.data.model.DownloadState
 import com.beatloop.music.ui.LocalPlayerConnection
 import com.beatloop.music.ui.navigation.Screen
 import com.beatloop.music.ui.viewmodel.SongActionsViewModel
 import com.beatloop.music.ui.viewmodel.PlayerViewModel
 import kotlinx.coroutines.launch
+import kotlin.math.absoluteValue
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -63,12 +74,18 @@ fun PlayerScreen(
     val currentQueueIndex by playerConnection?.currentQueueIndex?.collectAsState() ?: remember { mutableStateOf(0) }
     val currentMediaItem by playerConnection?.currentMediaItemFlow?.collectAsState() ?: remember { mutableStateOf(null) }
     
+    val playlists by songActionsViewModel.playlists.collectAsState()
+    val downloadUiStateMap by songActionsViewModel.downloadUiStateMap.collectAsState()
+    val preferredVideoQuality by viewModel.preferredVideoQuality.collectAsState()
+
     val sheetState = rememberModalBottomSheetState()
     var showQueue by remember { mutableStateOf(false) }
     var showLyrics by remember { mutableStateOf(false) }
     var showSleepTimerDialog by remember { mutableStateOf(false) }
+    var showAddToPlaylist by remember { mutableStateOf(false) }
+    var showCreatePlaylist by remember { mutableStateOf(false) }
     var activeSleepTimerMinutes by rememberSaveable { mutableStateOf<Int?>(null) }
-    
+    var isVideoMode by rememberSaveable { mutableStateOf(false) }
     LaunchedEffect(playerConnection) {
         playerConnection?.let { connection ->
             viewModel.setPlayFromQueueCallback { index ->
@@ -84,6 +101,8 @@ fun PlayerScreen(
             val title = item.mediaMetadata.title?.toString() ?: ""
             val artist = item.mediaMetadata.artist?.toString() ?: ""
             viewModel.checkIfLiked(songId)
+            viewModel.checkDownloadStatus(songId)
+            songActionsViewModel.observeDownload(songId)
             viewModel.loadLyrics(songId, title, artist, (duration / 1000).toInt())
             viewModel.loadVideoVotes(songId)
 
@@ -95,16 +114,96 @@ fun PlayerScreen(
             }
         } ?: viewModel.clearLyrics()
     }
-    
+
     // Extract colors from album art
     val context = LocalContext.current
-    val dominantColor by remember(currentMediaItem?.mediaMetadata?.artworkUri) {
-        mutableStateOf(Color(0xFF1DB954)) // Default green, can be extracted from artwork
+    val primaryColor = MaterialTheme.colorScheme.primary
+    val artworkUrl = currentMediaItem?.mediaMetadata?.artworkUri?.toString().toHighResArtworkUrl()
+    val dominantColor by produceState(
+        initialValue = primaryColor,
+        key1 = artworkUrl,
+        key2 = currentMediaItem?.mediaId
+    ) {
+        val fallback = primaryColor
+        if (artworkUrl.isNullOrBlank()) {
+            value = fallback
+            return@produceState
+        }
+
+        value = runCatching {
+            val request = ImageRequest.Builder(context)
+                .data(artworkUrl)
+                .allowHardware(false)
+                .build()
+            val drawable = context.imageLoader.execute(request).drawable ?: return@runCatching fallback
+            val bitmap = drawable.toBitmap(width = 96, height = 96)
+            val palette = Palette.from(bitmap).clearFilters().generate()
+            val colorInt = palette.getDominantColor(fallback.toArgb())
+            Color(colorInt)
+        }.getOrElse {
+            val id = currentMediaItem?.mediaId.orEmpty()
+            val hue = (id.hashCode().absoluteValue % 360).toFloat()
+            Color.hsl(hue, 0.58f, 0.42f)
+        }
     }
     val accentColor = MaterialTheme.colorScheme.primary
     val foregroundColor = MaterialTheme.colorScheme.onBackground
     val mutedForegroundColor = foregroundColor.copy(alpha = 0.74f)
     val chromeColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.28f)
+    val currentDownloadUi = currentMediaItem?.mediaId?.let { downloadUiStateMap[it] }
+    val isCurrentDownloading = currentDownloadUi?.state == DownloadState.DOWNLOADING
+    val isCurrentDownloaded = uiState.isDownloaded || currentDownloadUi?.state == DownloadState.DOWNLOADED
+    val currentDownloadProgress = currentDownloadUi?.progress
+    val currentFileSizeBytes = currentDownloadUi?.fileSizeBytes ?: uiState.downloadedFileSizeBytes
+
+    fun buildPlaybackMediaItem(videoMode: Boolean, quality: Int): MediaItem? {
+        val item = currentMediaItem ?: return null
+        val mediaId = item.mediaId
+        if (mediaId.isBlank()) return null
+
+        val uri = if (videoMode) {
+            "beatloop://video/$mediaId?quality=$quality".toUri()
+        } else {
+            "beatloop://song/$mediaId".toUri()
+        }
+
+        val metadata = MediaMetadata.Builder()
+            .setTitle(item.mediaMetadata.title)
+            .setArtist(item.mediaMetadata.artist)
+            .setArtworkUri(item.mediaMetadata.artworkUri)
+            .build()
+
+        return MediaItem.Builder()
+            .setMediaId(mediaId)
+            .setUri(uri)
+            .setMediaMetadata(metadata)
+            .build()
+    }
+
+    fun applyPlaybackMode(videoMode: Boolean, quality: Int = preferredVideoQuality) {
+        val item = currentMediaItem ?: return
+        val currentUri = item.localConfiguration?.uri
+        val currentHost = currentUri?.host
+        val currentQuality = currentUri?.getQueryParameter("quality")?.toIntOrNull() ?: 360
+
+        val alreadyApplied = if (videoMode) {
+            currentHost == "video" && currentQuality == quality
+        } else {
+            currentHost == "song"
+        }
+
+        if (alreadyApplied) return
+
+        buildPlaybackMediaItem(videoMode, quality)?.let { mediaItem ->
+            playerConnection?.replaceCurrentMediaItem(mediaItem, preservePosition = true)
+        }
+    }
+
+    LaunchedEffect(currentMediaItem?.mediaId, isVideoMode, preferredVideoQuality) {
+        if (isVideoMode) {
+            applyPlaybackMode(videoMode = true, quality = preferredVideoQuality)
+        }
+    }
     
     Box(
         modifier = Modifier
@@ -129,10 +228,10 @@ fun PlayerScreen(
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(horizontal = 16.dp, vertical = 8.dp),
-                shape = RoundedCornerShape(20.dp),
-                color = chromeColor,
-                tonalElevation = 1.dp,
-                shadowElevation = 1.dp
+                shape = RoundedCornerShape(0.dp),
+                color = Color.Transparent,
+                tonalElevation = 0.dp,
+                shadowElevation = 0.dp
             ) {
                 Row(
                     modifier = Modifier
@@ -198,16 +297,38 @@ fun PlayerScreen(
                             }
                         )
                     } else {
-                        // Album Art
-                        AsyncImage(
-                            model = currentMediaItem?.mediaMetadata?.artworkUri,
-                            contentDescription = "Album Art",
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .aspectRatio(1f)
-                                .clip(RoundedCornerShape(24.dp)),
-                            contentScale = ContentScale.Crop
-                        )
+                        if (isVideoMode) {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .aspectRatio(16f / 9f)
+                                    .clip(RoundedCornerShape(18.dp))
+                            ) {
+                                AndroidView(
+                                    modifier = Modifier.fillMaxSize(),
+                                    factory = { ctx ->
+                                        PlayerView(ctx).apply {
+                                            useController = false
+                                            player = playerConnection?.player
+                                        }
+                                    },
+                                    update = { view ->
+                                        view.player = playerConnection?.player
+                                    }
+                                )
+                            }
+                        } else {
+                            // Album Art
+                            AsyncImage(
+                                model = artworkUrl,
+                                contentDescription = "Album Art",
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .aspectRatio(1f)
+                                    .clip(RoundedCornerShape(24.dp)),
+                                contentScale = ContentScale.Crop
+                            )
+                        }
                     }
                 }
             }
@@ -217,10 +338,10 @@ fun PlayerScreen(
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(horizontal = 20.dp, vertical = 12.dp),
-                shape = RoundedCornerShape(22.dp),
-                color = chromeColor,
-                tonalElevation = 1.dp,
-                shadowElevation = 1.dp
+                shape = RoundedCornerShape(0.dp),
+                color = Color.Transparent,
+                tonalElevation = 0.dp,
+                shadowElevation = 0.dp
             ) {
                 Column(
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 14.dp)
@@ -246,6 +367,33 @@ fun PlayerScreen(
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis
                             )
+
+                            when {
+                                isCurrentDownloaded -> {
+                                    Text(
+                                        text = if (currentFileSizeBytes != null) {
+                                            "Downloaded • ${formatFileSize(currentFileSizeBytes)}"
+                                        } else {
+                                            "Downloaded"
+                                        },
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = accentColor
+                                    )
+                                }
+
+                                isCurrentDownloading -> {
+                                    val percent = currentDownloadProgress?.coerceIn(0, 100)
+                                    Text(
+                                        text = if (percent != null) {
+                                            "Downloading • $percent%"
+                                        } else {
+                                            "Downloading..."
+                                        },
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = accentColor
+                                    )
+                                }
+                            }
                         }
 
                         IconButton(
@@ -308,9 +456,9 @@ fun PlayerScreen(
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(horizontal = 20.dp),
-                shape = RoundedCornerShape(20.dp),
-                color = chromeColor,
-                tonalElevation = 1.dp
+                shape = RoundedCornerShape(0.dp),
+                color = Color.Transparent,
+                tonalElevation = 0.dp
             ) {
                 Column(
                     modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)
@@ -350,9 +498,9 @@ fun PlayerScreen(
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(horizontal = 20.dp, vertical = 18.dp),
-                shape = RoundedCornerShape(24.dp),
-                color = chromeColor,
-                tonalElevation = 1.dp
+                shape = RoundedCornerShape(0.dp),
+                color = Color.Transparent,
+                tonalElevation = 0.dp
             ) {
                 Row(
                     modifier = Modifier
@@ -435,9 +583,9 @@ fun PlayerScreen(
                     .fillMaxWidth()
                     .padding(horizontal = 20.dp, vertical = 8.dp)
                     .navigationBarsPadding(),
-                shape = RoundedCornerShape(20.dp),
-                color = chromeColor,
-                tonalElevation = 1.dp
+                shape = RoundedCornerShape(0.dp),
+                color = Color.Transparent,
+                tonalElevation = 0.dp
             ) {
                 Row(
                     modifier = Modifier
@@ -461,26 +609,37 @@ fun PlayerScreen(
                         )
                     }
 
-                    IconButton(onClick = {
-                        currentMediaItem?.let { item ->
-                            songActionsViewModel.downloadSong(
-                                SongItem(
-                                    id = item.mediaId,
-                                    title = item.mediaMetadata.title?.toString() ?: "Unknown",
-                                    artistsText = item.mediaMetadata.artist?.toString() ?: "Unknown",
-                                    thumbnailUrl = item.mediaMetadata.artworkUri?.toString()
+                    IconButton(
+                        enabled = !isCurrentDownloaded && !isCurrentDownloading,
+                        onClick = {
+                            currentMediaItem?.let { item ->
+                                songActionsViewModel.downloadSong(
+                                    SongItem(
+                                        id = item.mediaId,
+                                        title = item.mediaMetadata.title?.toString() ?: "Unknown",
+                                        artistsText = item.mediaMetadata.artist?.toString() ?: "Unknown",
+                                        thumbnailUrl = item.mediaMetadata.artworkUri?.toString()
+                                    ),
+                                    downloadVideo = isVideoMode,
+                                    videoQuality = preferredVideoQuality
                                 )
-                            )
+                                navController?.navigate(Screen.Downloads.route)
+                                onDismiss?.invoke()
+                            }
                         }
-                    }) {
+                    ) {
                         Icon(
-                            imageVector = Icons.Default.Download,
+                            imageVector = if (isCurrentDownloaded) Icons.Default.DownloadDone else Icons.Default.Download,
                             contentDescription = "Download",
-                            tint = mutedForegroundColor
+                            tint = when {
+                                isCurrentDownloaded -> accentColor
+                                isCurrentDownloading -> accentColor
+                                else -> mutedForegroundColor
+                            }
                         )
                     }
 
-                    IconButton(onClick = { navController?.navigate(Screen.Library.route) }) {
+                    IconButton(onClick = { showAddToPlaylist = true }) {
                         Icon(
                             imageVector = Icons.AutoMirrored.Filled.PlaylistAdd,
                             contentDescription = "Add to Playlist",
@@ -505,11 +664,23 @@ fun PlayerScreen(
                             tint = mutedForegroundColor
                         )
                     }
+
+                    IconButton(onClick = {
+                        isVideoMode = !isVideoMode
+                        applyPlaybackMode(videoMode = isVideoMode, quality = preferredVideoQuality)
+                    }) {
+                        Icon(
+                            imageVector = Icons.Default.OndemandVideo,
+                            contentDescription = "Video mode",
+                            tint = if (isVideoMode) accentColor else mutedForegroundColor
+                        )
+                    }
                 }
             }
         }
     }
-    
+
+
     // Queue Bottom Sheet
     if (showQueue) {
         ModalBottomSheet(
@@ -576,6 +747,67 @@ fun PlayerScreen(
             dismissButton = {
                 TextButton(onClick = { showSleepTimerDialog = false }) {
                     Text("Close")
+                }
+            }
+        )
+    }
+
+    if (showAddToPlaylist && currentMediaItem != null) {
+        val songItem = SongItem(
+            id = currentMediaItem!!.mediaId,
+            title = currentMediaItem!!.mediaMetadata.title?.toString() ?: "Unknown",
+            artistsText = currentMediaItem!!.mediaMetadata.artist?.toString() ?: "Unknown",
+            thumbnailUrl = currentMediaItem!!.mediaMetadata.artworkUri?.toString()
+        )
+        com.beatloop.music.ui.components.AddToPlaylistBottomSheet(
+            playlists = playlists,
+            onDismiss = { showAddToPlaylist = false },
+            onCreateNew = {
+                showAddToPlaylist = false
+                showCreatePlaylist = true
+            },
+            onSelectPlaylist = { playlistId ->
+                songActionsViewModel.addToPlaylist(playlistId, songItem, context)
+                showAddToPlaylist = false
+            }
+        )
+    }
+
+    if (showCreatePlaylist && currentMediaItem != null) {
+        var playlistName by remember { mutableStateOf("") }
+        val songItem = SongItem(
+            id = currentMediaItem!!.mediaId,
+            title = currentMediaItem!!.mediaMetadata.title?.toString() ?: "Unknown",
+            artistsText = currentMediaItem!!.mediaMetadata.artist?.toString() ?: "Unknown",
+            thumbnailUrl = currentMediaItem!!.mediaMetadata.artworkUri?.toString()
+        )
+        AlertDialog(
+            onDismissRequest = { showCreatePlaylist = false },
+            title = { Text("Create Playlist") },
+            text = {
+                OutlinedTextField(
+                    value = playlistName,
+                    onValueChange = { playlistName = it },
+                    label = { Text("Playlist name") },
+                    singleLine = true
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        if (playlistName.isNotBlank()) {
+                            songActionsViewModel.createPlaylistAndAddSong(playlistName, songItem, context)
+                            showCreatePlaylist = false
+                        }
+                    },
+                    enabled = playlistName.isNotBlank()
+                ) {
+                    Text("Create")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showCreatePlaylist = false }) {
+                    Text("Cancel")
                 }
             }
         )
@@ -815,4 +1047,21 @@ private fun formatCompactCount(value: Long): String {
         value >= 1_000L -> String.format("%.1fK", value / 1_000.0)
         else -> value.toString()
     }
+}
+
+private fun formatFileSize(bytes: Long): String {
+    if (bytes < 1024L) return "$bytes B"
+    val kb = bytes / 1024.0
+    if (kb < 1024.0) return String.format("%.1f KB", kb)
+    val mb = kb / 1024.0
+    if (mb < 1024.0) return String.format("%.2f MB", mb)
+    val gb = mb / 1024.0
+    return String.format("%.2f GB", gb)
+}
+
+private fun String?.toHighResArtworkUrl(): String? {
+    if (this.isNullOrBlank()) return this
+    return this
+        .replace(Regex("=w\\d+-h\\d+"), "=w1200-h1200")
+        .replace(Regex("=s\\d+"), "=s1200")
 }

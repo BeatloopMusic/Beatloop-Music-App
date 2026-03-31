@@ -1,5 +1,8 @@
 package com.beatloop.music.ui.screens
 
+import com.beatloop.music.ui.navigation.Screen
+
+import android.content.Intent
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -10,27 +13,46 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.navigation.NavController
+import com.beatloop.music.data.model.SongItem
 import com.beatloop.music.playback.createMediaItem
 import com.beatloop.music.ui.LocalPlayerConnection
+import com.beatloop.music.ui.components.AddToPlaylistBottomSheet
 import com.beatloop.music.ui.components.SongListItem
+import com.beatloop.music.ui.components.SongOptionsBottomSheet
 import com.beatloop.music.ui.viewmodel.LocalPlaylistViewModel
+import com.beatloop.music.ui.viewmodel.SongActionsViewModel
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun LocalPlaylistScreen(
     playlistId: Long,
     navController: NavController,
-    viewModel: LocalPlaylistViewModel = hiltViewModel()
+    viewModel: LocalPlaylistViewModel = hiltViewModel(),
+    songActionsViewModel: SongActionsViewModel = hiltViewModel()
 ) {
     val uiState by viewModel.uiState.collectAsState()
     val playerConnection = LocalPlayerConnection.current
+    val context = LocalContext.current
     
     var showRenameDialog by remember { mutableStateOf(false) }
     var newName by remember { mutableStateOf("") }
+    
+    // Song options state
+    var selectedSong by remember { mutableStateOf<SongItem?>(null) }
+    var showSongOptions by remember { mutableStateOf(false) }
+    var showAddToPlaylist by remember { mutableStateOf(false) }
+    var showCreatePlaylist by remember { mutableStateOf(false) }
+    var newPlaylistName by remember { mutableStateOf("") }
+
+    val playlists by songActionsViewModel.playlists.collectAsState()
+    val likedSongIds by songActionsViewModel.likedSongIds.collectAsState()
+    val downloadedSongIds by songActionsViewModel.downloadedSongIds.collectAsState()
+    val downloadUiStateMap by songActionsViewModel.downloadUiStateMap.collectAsState()
     
     LaunchedEffect(playlistId) {
         viewModel.loadPlaylist(playlistId)
@@ -212,7 +234,8 @@ fun LocalPlaylistScreen(
                                         }
                                     },
                                     onMoreClick = {
-                                        viewModel.removeSongFromPlaylist(song.id)
+                                        selectedSong = song
+                                        showSongOptions = true
                                     }
                                 )
                             }
@@ -256,4 +279,142 @@ fun LocalPlaylistScreen(
             }
         )
     }
+
+    // Song Options Bottom Sheet
+    if (showSongOptions && selectedSong != null) {
+        SongOptionsBottomSheet(
+            song = selectedSong!!,
+            isLiked = likedSongIds.contains(selectedSong!!.id),
+            isDownloaded = downloadedSongIds.contains(selectedSong!!.id),
+            downloadProgress = downloadUiStateMap[selectedSong!!.id]
+                ?.takeIf { it.state == com.beatloop.music.data.model.DownloadState.DOWNLOADING }
+                ?.progress,
+            downloadSizeBytes = downloadUiStateMap[selectedSong!!.id]?.fileSizeBytes,
+            onDismiss = { showSongOptions = false },
+            onPlayNext = {
+                playerConnection?.let { conn ->
+                    val mediaItem = createMediaItem(
+                        id = selectedSong!!.id,
+                        title = selectedSong!!.title,
+                        artist = selectedSong!!.artistsText,
+                        thumbnailUrl = selectedSong!!.thumbnailUrl,
+                        localPath = selectedSong!!.localPath
+                    )
+                    conn.addMediaItemNext(mediaItem)
+                }
+                showSongOptions = false
+            },
+            onAddToQueue = {
+                playerConnection?.let { conn ->
+                    val mediaItem = createMediaItem(
+                        id = selectedSong!!.id,
+                        title = selectedSong!!.title,
+                        artist = selectedSong!!.artistsText,
+                        thumbnailUrl = selectedSong!!.thumbnailUrl,
+                        localPath = selectedSong!!.localPath
+                    )
+                    conn.addMediaItem(mediaItem)
+                }
+                showSongOptions = false
+            },
+            onAddToPlaylist = {
+                showSongOptions = false
+                showAddToPlaylist = true
+            },
+            onRemoveFromPlaylist = {
+                viewModel.removeSongFromPlaylist(selectedSong!!.id)
+                showSongOptions = false
+            },
+            onLike = {
+                selectedSong?.let { song ->
+                    songActionsViewModel.toggleLike(song)
+                }
+                showSongOptions = false
+            },
+            onDownload = {
+                selectedSong?.let(songActionsViewModel::downloadSong)
+                navController.navigate(Screen.Downloads.route)
+                showSongOptions = false
+            },
+            onShare = {
+                selectedSong?.let { song ->
+                    val shareIntent = songActionsViewModel.createShareIntent(song)
+                    context.startActivity(Intent.createChooser(shareIntent, "Share song"))
+                }
+                showSongOptions = false
+            },
+            onGoToArtist = {
+                selectedSong?.artistId?.let { artistId ->
+                    navController.navigate(Screen.Artist.createRoute(artistId))
+                }
+                showSongOptions = false
+            },
+            onGoToAlbum = {
+                selectedSong?.albumId?.let { albumId ->
+                    navController.navigate("album/$albumId")
+                }
+                showSongOptions = false
+            }
+        )
+    }
+
+    // Add to Playlist Bottom Sheet
+    if (showAddToPlaylist && selectedSong != null) {
+        AddToPlaylistBottomSheet(
+            playlists = playlists,
+            onDismiss = { showAddToPlaylist = false },
+            onSelectPlaylist = { playlistId ->
+                selectedSong?.let { song ->
+                    songActionsViewModel.addToPlaylist(playlistId, song, context)
+                }
+                showAddToPlaylist = false
+            },
+            onCreateNew = {
+                showAddToPlaylist = false
+                showCreatePlaylist = true
+            }
+        )
+    }
+
+    // Create Playlist Dialog
+    if (showCreatePlaylist) {
+        AlertDialog(
+            onDismissRequest = { showCreatePlaylist = false },
+            title = { Text("Create Playlist") },
+            text = {
+                OutlinedTextField(
+                    value = newPlaylistName,
+                    onValueChange = { newPlaylistName = it },
+                    label = { Text("Playlist name") },
+                    singleLine = true
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        if (newPlaylistName.isNotBlank()) {
+                            selectedSong?.let { song ->
+                                songActionsViewModel.createPlaylistAndAddSong(newPlaylistName, song, context)
+                            }
+                            newPlaylistName = ""
+                            showCreatePlaylist = false
+                        }
+                    }
+                ) {
+                    Text("Create")
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = {
+                        newPlaylistName = ""
+                        showCreatePlaylist = false
+                    }
+                ) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
 }
+

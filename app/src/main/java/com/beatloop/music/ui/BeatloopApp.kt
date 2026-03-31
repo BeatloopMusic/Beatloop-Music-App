@@ -21,6 +21,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.activity.compose.BackHandler
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
@@ -89,6 +90,10 @@ fun BeatloopApp() {
     }
     
     Box(modifier = Modifier.fillMaxSize()) {
+        BackHandler(enabled = showFullPlayer) {
+            showFullPlayer = false
+        }
+
         Scaffold(
             bottomBar = {
                 AnimatedVisibility(

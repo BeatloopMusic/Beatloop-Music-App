@@ -111,7 +111,7 @@ class PlayerConnection(
     
     fun seekToNext() = mediaController.seekToNext()
     
-    fun seekToPrevious() = mediaController.seekToPrevious()
+    fun seekToPrevious() = mediaController.seekToPreviousMediaItem()
     
     // Aliases for compatibility
     fun skipToNext() = seekToNext()
@@ -186,6 +186,21 @@ class PlayerConnection(
     fun addMediaItemNext(mediaItem: MediaItem) {
         val nextIndex = mediaController.currentMediaItemIndex + 1
         mediaController.addMediaItem(nextIndex, mediaItem)
+    }
+
+    fun replaceCurrentMediaItem(mediaItem: MediaItem, preservePosition: Boolean = true) {
+        val index = mediaController.currentMediaItemIndex
+        if (index !in 0 until mediaController.mediaItemCount) return
+
+        val position = if (preservePosition) mediaController.currentPosition else 0L
+        val wasPlaying = mediaController.isPlaying
+
+        mediaController.replaceMediaItem(index, mediaItem)
+        mediaController.seekTo(index, position)
+        mediaController.prepare()
+        if (wasPlaying) {
+            mediaController.play()
+        }
     }
     
     fun clearQueue() {

@@ -24,7 +24,9 @@ data class Song(
     val lastPlayedAt: Long? = null,
     val downloadState: DownloadState = DownloadState.NOT_DOWNLOADED,
     val localPath: String? = null,
-    val createdAt: Long = System.currentTimeMillis()
+    val createdAt: Long = System.currentTimeMillis(),
+    val lastUpdatedTimestamp: Long = System.currentTimeMillis(),
+    val isSynced: Boolean = false
 )
 
 @Serializable
@@ -41,6 +43,7 @@ data class SongItem(
     val id: String,
     val title: String,
     val artistsText: String = "",
+    val artistId: String? = null,
     val thumbnailUrl: String? = null,
     val albumId: String? = null,
     val duration: Long? = null,
@@ -58,6 +61,7 @@ data class SongItem(
             id = id,
             title = title,
             artistsText = artists.joinToString(", ") { it.name },
+            artistId = artists.firstOrNull()?.id,
             thumbnailUrl = thumbnailUrl,
             albumId = albumId,
             duration = duration

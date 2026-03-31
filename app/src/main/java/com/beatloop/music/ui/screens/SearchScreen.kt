@@ -8,6 +8,7 @@ import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.PlaylistAdd
 import androidx.compose.material.icons.filled.Clear
 import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Search
@@ -56,12 +57,19 @@ fun SearchScreen(
     
     val playlists by songActionsViewModel.playlists.collectAsState()
     val likedSongIds by songActionsViewModel.likedSongIds.collectAsState()
+    val downloadedSongIds by songActionsViewModel.downloadedSongIds.collectAsState()
+    val downloadUiStateMap by songActionsViewModel.downloadUiStateMap.collectAsState()
     
     // Song Options Bottom Sheet
     if (showSongOptions && selectedSong != null) {
         SongOptionsBottomSheet(
             song = selectedSong!!,
             isLiked = likedSongIds.contains(selectedSong!!.id),
+            isDownloaded = downloadedSongIds.contains(selectedSong!!.id),
+            downloadProgress = downloadUiStateMap[selectedSong!!.id]
+                ?.takeIf { it.state == com.beatloop.music.data.model.DownloadState.DOWNLOADING }
+                ?.progress,
+            downloadSizeBytes = downloadUiStateMap[selectedSong!!.id]?.fileSizeBytes,
             onDismiss = { showSongOptions = false },
             onPlayNext = {
                 playerConnection?.addMediaItemNext(
@@ -92,9 +100,15 @@ fun SearchScreen(
             },
             onDownload = {
                 selectedSong?.let(songActionsViewModel::downloadSong)
+                navController.navigate(Screen.Downloads.route)
                 showSongOptions = false
             },
-            onGoToArtist = { /* TODO: Navigate to artist */ },
+            onGoToArtist = {
+                selectedSong?.artistId?.let { artistId ->
+                    navController.navigate(Screen.Artist.createRoute(artistId))
+                }
+                showSongOptions = false
+            },
             onGoToAlbum = {
                 selectedSong!!.albumId?.let { albumId ->
                     navController.navigate(Screen.Album.createRoute(albumId))
@@ -116,7 +130,7 @@ fun SearchScreen(
                 showCreatePlaylist = true
             },
             onSelectPlaylist = { playlistId ->
-                songActionsViewModel.addToPlaylist(playlistId, selectedSong!!)
+                songActionsViewModel.addToPlaylist(playlistId, selectedSong!!, context)
             }
         )
     }
@@ -139,7 +153,7 @@ fun SearchScreen(
                 TextButton(
                     onClick = {
                         if (playlistName.isNotBlank()) {
-                            songActionsViewModel.createPlaylistAndAddSong(playlistName, selectedSong!!)
+                            songActionsViewModel.createPlaylistAndAddSong(playlistName, selectedSong!!, context)
                             showCreatePlaylist = false
                         }
                     },
@@ -313,6 +327,22 @@ fun SearchScreen(
                                         )
                                         conn.setMediaItem(mediaItem)
                                     }
+                                },
+                                trailing = {
+                                    IconButton(
+                                        onClick = {
+                                            selectedSong = song
+                                            showAddToPlaylist = true
+                                        },
+                                        modifier = Modifier.size(34.dp)
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.AutoMirrored.Filled.PlaylistAdd,
+                                            contentDescription = "Add to playlist",
+                                            modifier = Modifier.size(20.dp)
+                                        )
+                                    }
+                                    Spacer(modifier = Modifier.width(8.dp))
                                 },
                                 onMoreClick = {
                                     selectedSong = song

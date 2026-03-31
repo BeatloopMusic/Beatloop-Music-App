@@ -7,6 +7,7 @@ import androidx.datastore.preferences.preferencesDataStore
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -65,6 +66,10 @@ class PreferencesManager @Inject constructor(
     val persistentQueueEnabled: Flow<Boolean> = dataStore.data
         .catch { emit(emptyPreferences()) }
         .map { it[PERSISTENT_QUEUE] ?: true }
+
+    val queueLocked: Flow<Boolean> = dataStore.data
+        .catch { emit(emptyPreferences()) }
+        .map { it[QUEUE_LOCKED] ?: false }
     
     // SponsorBlock preferences
     val sponsorBlockEnabled: Flow<Boolean> = dataStore.data
@@ -147,6 +152,16 @@ class PreferencesManager @Inject constructor(
         .map { preferences ->
             AudioQuality.fromValue(preferences[DOWNLOAD_QUALITY] ?: AudioQuality.VERY_HIGH.value)
         }
+
+    val videoPlaybackQuality: Flow<Int> = dataStore.data
+        .catch { emit(emptyPreferences()) }
+        .map { preferences ->
+            val raw = preferences[VIDEO_PLAYBACK_QUALITY] ?: 360
+            when (raw) {
+                144, 240, 360, 480, 720 -> raw
+                else -> 360
+            }
+        }
     
     // Update functions
     suspend fun setThemeMode(mode: ThemeMode) {
@@ -187,6 +202,10 @@ class PreferencesManager @Inject constructor(
     
     suspend fun setPersistentQueueEnabled(enabled: Boolean) {
         dataStore.edit { it[PERSISTENT_QUEUE] = enabled }
+    }
+
+    suspend fun setQueueLocked(locked: Boolean) {
+        dataStore.edit { it[QUEUE_LOCKED] = locked }
     }
     
     suspend fun setSponsorBlockEnabled(enabled: Boolean) {
@@ -280,6 +299,85 @@ class PreferencesManager @Inject constructor(
     suspend fun setDownloadQuality(quality: AudioQuality) {
         dataStore.edit { it[DOWNLOAD_QUALITY] = quality.value }
     }
+
+    suspend fun setVideoPlaybackQuality(quality: Int) {
+        val clamped = when (quality) {
+            144, 240, 360, 480, 720 -> quality
+            else -> 360
+        }
+        dataStore.edit { it[VIDEO_PLAYBACK_QUALITY] = clamped }
+    }
+
+    suspend fun exportSyncPreferences(): Map<String, String> {
+        val prefs = dataStore.data.first()
+        return mapOf(
+            "theme_mode" to (prefs[THEME_MODE] ?: ThemeMode.SYSTEM.value),
+            "dynamic_colors" to (prefs[DYNAMIC_COLORS] ?: true).toString(),
+            "amoled_black" to (prefs[AMOLED_BLACK] ?: false).toString(),
+            "audio_quality" to (prefs[AUDIO_QUALITY] ?: AudioQuality.HIGH.value),
+            "skip_silence" to (prefs[SKIP_SILENCE] ?: false).toString(),
+            "audio_normalization" to (prefs[AUDIO_NORMALIZATION] ?: true).toString(),
+            "persistent_queue" to (prefs[PERSISTENT_QUEUE] ?: true).toString(),
+            "queue_locked" to (prefs[QUEUE_LOCKED] ?: false).toString(),
+            "sponsorblock_enabled" to (prefs[SPONSORBLOCK_ENABLED] ?: true).toString(),
+            "skip_sponsor" to (prefs[SKIP_SPONSOR] ?: true).toString(),
+            "skip_selfpromo" to (prefs[SKIP_SELFPROMO] ?: true).toString(),
+            "skip_intro" to (prefs[SKIP_INTRO] ?: true).toString(),
+            "skip_outro" to (prefs[SKIP_OUTRO] ?: true).toString(),
+            "skip_music_offtopic" to (prefs[SKIP_MUSIC_OFFTOPIC] ?: true).toString(),
+            "content_language" to (prefs[CONTENT_LANGUAGE] ?: "en"),
+            "content_country" to (prefs[CONTENT_COUNTRY] ?: "US"),
+            "onboarding_completed" to (prefs[ONBOARDING_COMPLETED] ?: false).toString(),
+            "preferred_languages" to ((prefs[PREFERRED_LANGUAGES] ?: emptySet()).joinToString("|")),
+            "preferred_singers" to ((prefs[PREFERRED_SINGERS] ?: emptySet()).joinToString("|")),
+            "preferred_lyricists" to ((prefs[PREFERRED_LYRICISTS] ?: emptySet()).joinToString("|")),
+            "preferred_music_directors" to ((prefs[PREFERRED_MUSIC_DIRECTORS] ?: emptySet()).joinToString("|")),
+            "max_cache_size" to (prefs[MAX_CACHE_SIZE] ?: 512L).toString(),
+            "download_quality" to (prefs[DOWNLOAD_QUALITY] ?: AudioQuality.VERY_HIGH.value),
+            "video_playback_quality" to (prefs[VIDEO_PLAYBACK_QUALITY] ?: 360).toString()
+        )
+    }
+
+    suspend fun applySyncPreferences(values: Map<String, String>) {
+        fun parseSet(raw: String?): Set<String> = raw
+            ?.split("|")
+            ?.map { it.trim() }
+            ?.filter { it.isNotBlank() }
+            ?.toSet()
+            ?: emptySet()
+
+        dataStore.edit { prefs ->
+            values["theme_mode"]?.let { prefs[THEME_MODE] = it }
+            values["dynamic_colors"]?.toBooleanStrictOrNull()?.let { prefs[DYNAMIC_COLORS] = it }
+            values["amoled_black"]?.toBooleanStrictOrNull()?.let { prefs[AMOLED_BLACK] = it }
+            values["audio_quality"]?.let { prefs[AUDIO_QUALITY] = it }
+            values["skip_silence"]?.toBooleanStrictOrNull()?.let { prefs[SKIP_SILENCE] = it }
+            values["audio_normalization"]?.toBooleanStrictOrNull()?.let { prefs[AUDIO_NORMALIZATION] = it }
+            values["persistent_queue"]?.toBooleanStrictOrNull()?.let { prefs[PERSISTENT_QUEUE] = it }
+            values["queue_locked"]?.toBooleanStrictOrNull()?.let { prefs[QUEUE_LOCKED] = it }
+            values["sponsorblock_enabled"]?.toBooleanStrictOrNull()?.let { prefs[SPONSORBLOCK_ENABLED] = it }
+            values["skip_sponsor"]?.toBooleanStrictOrNull()?.let { prefs[SKIP_SPONSOR] = it }
+            values["skip_selfpromo"]?.toBooleanStrictOrNull()?.let { prefs[SKIP_SELFPROMO] = it }
+            values["skip_intro"]?.toBooleanStrictOrNull()?.let { prefs[SKIP_INTRO] = it }
+            values["skip_outro"]?.toBooleanStrictOrNull()?.let { prefs[SKIP_OUTRO] = it }
+            values["skip_music_offtopic"]?.toBooleanStrictOrNull()?.let { prefs[SKIP_MUSIC_OFFTOPIC] = it }
+            values["content_language"]?.let { prefs[CONTENT_LANGUAGE] = it }
+            values["content_country"]?.let { prefs[CONTENT_COUNTRY] = it }
+            values["onboarding_completed"]?.toBooleanStrictOrNull()?.let { prefs[ONBOARDING_COMPLETED] = it }
+            values["preferred_languages"]?.let { prefs[PREFERRED_LANGUAGES] = parseSet(it) }
+            values["preferred_singers"]?.let { prefs[PREFERRED_SINGERS] = parseSet(it) }
+            values["preferred_lyricists"]?.let { prefs[PREFERRED_LYRICISTS] = parseSet(it) }
+            values["preferred_music_directors"]?.let { prefs[PREFERRED_MUSIC_DIRECTORS] = parseSet(it) }
+            values["max_cache_size"]?.toLongOrNull()?.let { prefs[MAX_CACHE_SIZE] = it }
+            values["download_quality"]?.let { prefs[DOWNLOAD_QUALITY] = it }
+            values["video_playback_quality"]?.toIntOrNull()?.let {
+                prefs[VIDEO_PLAYBACK_QUALITY] = when (it) {
+                    144, 240, 360, 480, 720 -> it
+                    else -> 360
+                }
+            }
+        }
+    }
     
     companion object {
         private val THEME_MODE = stringPreferencesKey("theme_mode")
@@ -289,6 +387,7 @@ class PreferencesManager @Inject constructor(
         private val SKIP_SILENCE = booleanPreferencesKey("skip_silence")
         private val AUDIO_NORMALIZATION = booleanPreferencesKey("audio_normalization")
         private val PERSISTENT_QUEUE = booleanPreferencesKey("persistent_queue")
+        private val QUEUE_LOCKED = booleanPreferencesKey("queue_locked")
         private val SPONSORBLOCK_ENABLED = booleanPreferencesKey("sponsorblock_enabled")
         private val SKIP_SPONSOR = booleanPreferencesKey("skip_sponsor")
         private val SKIP_SELFPROMO = booleanPreferencesKey("skip_selfpromo")
@@ -304,6 +403,7 @@ class PreferencesManager @Inject constructor(
         private val PREFERRED_MUSIC_DIRECTORS = stringSetPreferencesKey("preferred_music_directors")
         private val MAX_CACHE_SIZE = longPreferencesKey("max_cache_size")
         private val DOWNLOAD_QUALITY = stringPreferencesKey("download_quality")
+        private val VIDEO_PLAYBACK_QUALITY = intPreferencesKey("video_playback_quality")
     }
 }
 

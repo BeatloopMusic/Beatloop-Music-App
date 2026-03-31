@@ -5,7 +5,7 @@ import androidx.lifecycle.viewModelScope
 import com.beatloop.music.data.model.AlbumItem
 import com.beatloop.music.data.model.PlaylistItem
 import com.beatloop.music.data.model.SongItem
-import com.beatloop.music.data.repository.MusicRepository
+import com.beatloop.music.domain.usecase.home.GetHomeContentUseCase
 import com.beatloop.music.utils.NetworkConnectivityObserver
 import com.beatloop.music.utils.NetworkStatus
 import dagger.hilt.android.lifecycle.HiltViewModel
@@ -38,13 +38,14 @@ data class HomeUiState(
 
 @HiltViewModel
 class HomeViewModel @Inject constructor(
-    private val musicRepository: MusicRepository,
+    private val getHomeContentUseCase: GetHomeContentUseCase,
     private val networkConnectivityObserver: NetworkConnectivityObserver
 ) : ViewModel() {
     
     private val _uiState = MutableStateFlow(HomeUiState())
     val uiState: StateFlow<HomeUiState> = _uiState.asStateFlow()
     private var networkMessageJob: Job? = null
+    private var retryWhenOnlineJob: Job? = null
     
     init {
         _uiState.update { it.copy(greeting = getGreeting()) }
@@ -68,6 +69,7 @@ class HomeViewModel @Inject constructor(
                 
                 // If we just came back online and have no content, reload
                 if (isNowOnline && wasOffline && _uiState.value.quickPicks.isEmpty()) {
+                    retryWhenOnlineJob?.cancel()
                     loadHome(forceRefresh = true)
                 }
 
@@ -81,7 +83,7 @@ class HomeViewModel @Inject constructor(
     }
 
     fun onHomeVisible() {
-        loadHome(forceRefresh = true)
+        loadHome(forceRefresh = false)
     }
     
     fun loadHome(forceRefresh: Boolean = false) {
@@ -106,6 +108,7 @@ class HomeViewModel @Inject constructor(
                     showNetworkMessage = true
                 ) 
             }
+            scheduleRetryUntilNetworkAvailable()
             return
         }
         
@@ -113,7 +116,7 @@ class HomeViewModel @Inject constructor(
             _uiState.update { it.copy(isLoading = true, error = null) }
             val refreshNonce = System.currentTimeMillis()
             
-            musicRepository.getHome(refreshNonce)
+            getHomeContentUseCase(refreshNonce)
                 .onSuccess { homeContent ->
                     _uiState.update {
                         it.copy(
@@ -131,13 +134,36 @@ class HomeViewModel @Inject constructor(
                     }
                 }
                 .onFailure { error ->
+                    val offlineNow = !networkConnectivityObserver.isNetworkAvailable()
                     _uiState.update {
                         it.copy(
                             isLoading = false,
-                            error = error.message ?: "Failed to load content. Please try again."
+                            error = if (offlineNow) {
+                                "No internet connection. Retrying automatically when network is back."
+                            } else {
+                                error.message ?: "Failed to load content. Please try again."
+                            }
                         )
                     }
+
+                    if (offlineNow) {
+                        scheduleRetryUntilNetworkAvailable()
+                    }
                 }
+        }
+    }
+
+    private fun scheduleRetryUntilNetworkAvailable() {
+        if (retryWhenOnlineJob?.isActive == true) return
+
+        retryWhenOnlineJob = viewModelScope.launch {
+            while (true) {
+                if (networkConnectivityObserver.isNetworkAvailable()) {
+                    loadHome(forceRefresh = true)
+                    break
+                }
+                delay(2000)
+            }
         }
     }
     

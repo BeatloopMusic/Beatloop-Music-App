@@ -1,7 +1,7 @@
 package com.beatloop.music.ui.navigation
 
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Home
+import androidx.compose.material.icons.rounded.Home
 import androidx.compose.material.icons.filled.LibraryMusic
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Settings
@@ -26,7 +26,7 @@ sealed class Screen(
     data object Home : Screen(
         route = "home",
         title = "Home",
-        selectedIcon = Icons.Filled.Home,
+        selectedIcon = Icons.Rounded.Home,
         unselectedIcon = Icons.Outlined.Home
     )
     
@@ -113,6 +113,6 @@ sealed class Screen(
     )
     
     companion object {
-        val bottomNavItems = listOf(Home, Search, Library, Settings)
+        val bottomNavItems get() = listOf(Home, Search, Library, Settings)
     }
 }

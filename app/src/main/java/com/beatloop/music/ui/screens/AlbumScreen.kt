@@ -1,5 +1,7 @@
 package com.beatloop.music.ui.screens
 
+import com.beatloop.music.ui.navigation.Screen
+
 import android.content.Intent
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
@@ -54,6 +56,8 @@ fun AlbumScreen(
     
     val playlists by songActionsViewModel.playlists.collectAsState()
     val likedSongIds by songActionsViewModel.likedSongIds.collectAsState()
+    val downloadedSongIds by songActionsViewModel.downloadedSongIds.collectAsState()
+    val downloadUiStateMap by songActionsViewModel.downloadUiStateMap.collectAsState()
     
     LaunchedEffect(albumId) {
         viewModel.loadAlbum(albumId)
@@ -64,6 +68,11 @@ fun AlbumScreen(
         SongOptionsBottomSheet(
             song = selectedSong!!,
             isLiked = likedSongIds.contains(selectedSong!!.id),
+            isDownloaded = downloadedSongIds.contains(selectedSong!!.id),
+            downloadProgress = downloadUiStateMap[selectedSong!!.id]
+                ?.takeIf { it.state == com.beatloop.music.data.model.DownloadState.DOWNLOADING }
+                ?.progress,
+            downloadSizeBytes = downloadUiStateMap[selectedSong!!.id]?.fileSizeBytes,
             onDismiss = { showSongOptions = false },
             onPlayNext = {
                 playerConnection?.let { conn ->
@@ -103,6 +112,7 @@ fun AlbumScreen(
             },
             onDownload = {
                 selectedSong?.let(songActionsViewModel::downloadSong)
+                navController.navigate(Screen.Downloads.route)
                 showSongOptions = false
             },
             onShare = {
@@ -113,7 +123,9 @@ fun AlbumScreen(
                 showSongOptions = false
             },
             onGoToArtist = {
-                // Can navigate to artist from album
+                selectedSong?.artistId?.let { artistId ->
+                    navController.navigate(Screen.Artist.createRoute(artistId))
+                }
                 showSongOptions = false
             },
             onGoToAlbum = {
@@ -130,7 +142,7 @@ fun AlbumScreen(
             onDismiss = { showAddToPlaylist = false },
             onSelectPlaylist = { playlistId ->
                 selectedSong?.let { song ->
-                    songActionsViewModel.addToPlaylist(playlistId, song)
+                    songActionsViewModel.addToPlaylist(playlistId, song, context)
                 }
                 showAddToPlaylist = false
             },
@@ -159,7 +171,7 @@ fun AlbumScreen(
                     onClick = {
                         if (newPlaylistName.isNotBlank()) {
                             selectedSong?.let { song ->
-                                songActionsViewModel.createPlaylistAndAddSong(newPlaylistName, song)
+                                songActionsViewModel.createPlaylistAndAddSong(newPlaylistName, song, context)
                             }
                             newPlaylistName = ""
                             showCreatePlaylist = false
@@ -379,3 +391,4 @@ fun AlbumScreen(
         }
     }
 }
+

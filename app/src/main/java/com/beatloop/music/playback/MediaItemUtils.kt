@@ -26,9 +26,19 @@ fun createMediaItem(
         .setArtworkUri(artworkUri)
         .build()
     
+    val uri = if (localPath != null) {
+        if (localPath.startsWith("content://") || localPath.startsWith("file://")) {
+            localPath.toUri()
+        } else {
+            java.io.File(localPath).toURI().toString().toUri()
+        }
+    } else {
+        "beatloop://song/$id".toUri()
+    }
+
     return MediaItem.Builder()
         .setMediaId(id)
-        .setUri(localPath?.toUri() ?: "beatloop://song/$id".toUri())
+        .setUri(uri)
         .setMediaMetadata(metadata)
         .build()
 }

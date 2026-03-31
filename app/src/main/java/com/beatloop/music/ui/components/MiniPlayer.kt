@@ -65,7 +65,10 @@ fun MiniPlayer(
             ) {
                 // Album art
                 AsyncImage(
-                    model = currentMediaItem.mediaMetadata.artworkUri,
+                    model = currentMediaItem.mediaMetadata.artworkUri
+                        ?.toString()
+                        ?.replace(Regex("=w\\d+-h\\d+"), "=w600-h600")
+                        ?.replace(Regex("=s\\d+"), "=s600"),
                     contentDescription = null,
                     modifier = Modifier
                         .size(48.dp)

@@ -59,9 +59,15 @@ fun BottomNavigationBar(
                     }
                 },
                 icon = {
+                    val iconVector = if (selected) {
+                        screen.selectedIcon ?: Icons.Filled.Home
+                    } else {
+                        screen.unselectedIcon ?: Icons.Outlined.Home
+                    }
                     Icon(
-                        imageVector = if (selected) screen.selectedIcon ?: Icons.Filled.Home else screen.unselectedIcon ?: Icons.Outlined.Home,
-                        contentDescription = screen.title
+                        imageVector = iconVector,
+                        contentDescription = screen.title,
+                        modifier = Modifier.size(24.dp)
                     )
                 },
                 label = {

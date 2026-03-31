@@ -7,7 +7,10 @@ import androidx.room.PrimaryKey
 data class SearchHistory(
     @PrimaryKey
     val query: String,
-    val timestamp: Long = System.currentTimeMillis()
+    val timestamp: Long = System.currentTimeMillis(),
+    val searchCount: Int = 1,
+    val lastUpdatedTimestamp: Long = System.currentTimeMillis(),
+    val isSynced: Boolean = false
 )
 
 @Entity(tableName = "play_history")

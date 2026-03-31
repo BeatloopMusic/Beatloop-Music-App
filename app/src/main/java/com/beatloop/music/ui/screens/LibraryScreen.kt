@@ -2,6 +2,8 @@ package com.beatloop.music.ui.screens
 
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
@@ -15,23 +17,30 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.navigation.NavController
+import kotlinx.coroutines.launch
 import com.beatloop.music.playback.createMediaItem
 import com.beatloop.music.ui.LocalPlayerConnection
 import com.beatloop.music.ui.components.SongListItem
 import com.beatloop.music.ui.navigation.Screen
 import com.beatloop.music.ui.viewmodel.LibraryViewModel
+import com.beatloop.music.ui.viewmodel.SongActionsViewModel
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun LibraryScreen(
     navController: NavController,
-    viewModel: LibraryViewModel = hiltViewModel()
+    viewModel: LibraryViewModel = hiltViewModel(),
+    songActionsViewModel: SongActionsViewModel = hiltViewModel()
 ) {
     val uiState by viewModel.uiState.collectAsState()
+    val downloadSizeMap by viewModel.downloadSizeMap.collectAsState()
+    val activeDownloadStateMap by songActionsViewModel.downloadUiStateMap.collectAsState()
+    val activeDownloadSongInfo by songActionsViewModel.activeDownloadSongInfo.collectAsState()
     val playerConnection = LocalPlayerConnection.current
     
-    var selectedTab by remember { mutableStateOf(0) }
     val tabs = listOf("Playlists", "Downloads", "History", "Liked")
+    val pagerState = rememberPagerState(pageCount = { tabs.size })
+    val scope = rememberCoroutineScope()
     
     var showCreatePlaylistDialog by remember { mutableStateOf(false) }
     var newPlaylistName by remember { mutableStateOf("") }
@@ -59,75 +68,96 @@ fun LibraryScreen(
         ) {
             // Tab Row
             ScrollableTabRow(
-                selectedTabIndex = selectedTab,
+                selectedTabIndex = pagerState.currentPage,
                 edgePadding = 16.dp
             ) {
                 tabs.forEachIndexed { index, title ->
                     Tab(
-                        selected = selectedTab == index,
-                        onClick = { selectedTab = index },
+                        selected = pagerState.currentPage == index,
+                        onClick = {
+                            scope.launch {
+                                pagerState.animateScrollToPage(index)
+                            }
+                        },
                         text = { Text(title) }
                     )
                 }
             }
-            
-            when (selectedTab) {
-                0 -> PlaylistsTab(
-                    playlists = uiState.playlists,
-                    onPlaylistClick = { playlist ->
-                        navController.navigate(Screen.LocalPlaylist.createRoute(playlist.id))
-                    },
-                    onCreatePlaylist = { showCreatePlaylistDialog = true },
-                    onDeletePlaylist = { viewModel.deletePlaylist(it) }
-                )
-                1 -> DownloadsTab(
-                    downloads = uiState.downloads,
-                    onSongClick = { song ->
-                        playerConnection?.let { conn ->
-                            val mediaItem = createMediaItem(
-                                id = song.id,
-                                title = song.title,
-                                artist = song.artistsText,
-                                thumbnailUrl = song.thumbnailUrl,
-                                localPath = song.localPath
-                            )
-                            conn.setMediaItem(mediaItem)
-                        }
-                    },
-                    onDeleteDownload = { viewModel.deleteDownload(it) }
-                )
-                2 -> HistoryTab(
-                    history = uiState.playHistory,
-                    onSongClick = { song ->
-                        playerConnection?.let { conn ->
-                            val mediaItem = createMediaItem(
-                                id = song.id,
-                                title = song.title,
-                                artist = song.artistsText,
-                                thumbnailUrl = song.thumbnailUrl,
-                                localPath = song.localPath
-                            )
-                            conn.setMediaItem(mediaItem)
-                        }
-                    },
-                    onClearHistory = { viewModel.clearHistory() }
-                )
-                3 -> LikedSongsTab(
-                    likedSongs = uiState.likedSongs,
-                    onSongClick = { song ->
-                        playerConnection?.let { conn ->
-                            val mediaItem = createMediaItem(
-                                id = song.id,
-                                title = song.title,
-                                artist = song.artistsText,
-                                thumbnailUrl = song.thumbnailUrl,
-                                localPath = song.localPath
-                            )
-                            conn.setMediaItem(mediaItem)
-                        }
-                    },
-                    onUnlike = { viewModel.unlikeSong(it) }
-                )
+
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f)
+            ) {
+                HorizontalPager(
+                    state = pagerState,
+                    modifier = Modifier.fillMaxSize()
+                ) { page ->
+                    when (page) {
+                        0 -> PlaylistsTab(
+                            playlists = uiState.playlists,
+                            onPlaylistClick = { playlist ->
+                                navController.navigate(Screen.LocalPlaylist.createRoute(playlist.id))
+                            },
+                            onCreatePlaylist = { showCreatePlaylistDialog = true },
+                            onDeletePlaylist = { viewModel.deletePlaylist(it) }
+                        )
+
+                        1 -> DownloadsTab(
+                            downloads = uiState.downloads,
+                            downloadSizeMap = downloadSizeMap,
+                            activeDownloadStateMap = activeDownloadStateMap,
+                            activeDownloadSongInfo = activeDownloadSongInfo,
+                            onSongClick = { song ->
+                                playerConnection?.let { conn ->
+                                    val mediaItem = createMediaItem(
+                                        id = song.id,
+                                        title = song.title,
+                                        artist = song.artistsText,
+                                        thumbnailUrl = song.thumbnailUrl,
+                                        localPath = song.localPath
+                                    )
+                                    conn.setMediaItem(mediaItem)
+                                }
+                            },
+                            onDeleteDownload = { viewModel.deleteDownload(it) },
+                            onCancelDownload = { songActionsViewModel.cancelDownload(it) }
+                        )
+
+                        2 -> HistoryTab(
+                            history = uiState.playHistory,
+                            onSongClick = { song ->
+                                playerConnection?.let { conn ->
+                                    val mediaItem = createMediaItem(
+                                        id = song.id,
+                                        title = song.title,
+                                        artist = song.artistsText,
+                                        thumbnailUrl = song.thumbnailUrl,
+                                        localPath = song.localPath
+                                    )
+                                    conn.setMediaItem(mediaItem)
+                                }
+                            }
+                        )
+
+                        else -> LikedSongsTab(
+                            likedSongs = uiState.likedSongs,
+                            onSongClick = { song ->
+                                playerConnection?.let { conn ->
+                                    val mediaItem = createMediaItem(
+                                        id = song.id,
+                                        title = song.title,
+                                        artist = song.artistsText,
+                                        thumbnailUrl = song.thumbnailUrl,
+                                        localPath = song.localPath
+                                    )
+                                    conn.setMediaItem(mediaItem)
+                                }
+                            },
+                            onUnlike = { viewModel.unlikeSong(it) }
+                        )
+                    }
+                }
             }
         }
     }
@@ -247,10 +277,21 @@ private fun PlaylistsTab(
 @Composable
 private fun DownloadsTab(
     downloads: List<com.beatloop.music.data.model.SongItem>,
+    downloadSizeMap: Map<String, Long>,
+    activeDownloadStateMap: Map<String, com.beatloop.music.ui.viewmodel.SongActionsViewModel.DownloadUiState>,
+    activeDownloadSongInfo: Map<String, com.beatloop.music.ui.viewmodel.SongActionsViewModel.DownloadSongInfo>,
     onSongClick: (com.beatloop.music.data.model.SongItem) -> Unit,
-    onDeleteDownload: (String) -> Unit
+    onDeleteDownload: (String) -> Unit,
+    onCancelDownload: (String) -> Unit
 ) {
-    if (downloads.isEmpty()) {
+    val activeDownloads = activeDownloadStateMap
+        .filterValues { it.state == com.beatloop.music.data.model.DownloadState.DOWNLOADING }
+        .mapNotNull { (songId, ui) ->
+            val info = activeDownloadSongInfo[songId] ?: return@mapNotNull null
+            Triple(songId, info, ui)
+        }
+
+    if (downloads.isEmpty() && activeDownloads.isEmpty()) {
         EmptyState(
             icon = Icons.Default.Download,
             title = "No downloads",
@@ -261,12 +302,95 @@ private fun DownloadsTab(
             modifier = Modifier.fillMaxSize(),
             contentPadding = PaddingValues(vertical = 8.dp)
         ) {
-            items(downloads) { song ->
+            if (activeDownloads.isNotEmpty()) {
+                item {
+                    Text(
+                        text = "Active Downloads",
+                        style = MaterialTheme.typography.titleSmall,
+                        color = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
+                    )
+                }
+
+                items(activeDownloads, key = { it.first }) { (songId, info, ui) ->
+                    ListItem(
+                        headlineContent = { Text(info.title, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis) },
+                        supportingContent = { Text("${(ui.progress ?: 0).coerceIn(0, 100)}% • ${info.artist}") },
+                        leadingContent = {
+                            CircularProgressIndicator(
+                                progress = { (ui.progress ?: 0).coerceIn(0, 100) / 100f },
+                                modifier = Modifier.size(28.dp),
+                                strokeWidth = 3.dp
+                            )
+                        },
+                        trailingContent = {
+                            IconButton(onClick = { onCancelDownload(songId) }) {
+                                Icon(Icons.Default.Close, contentDescription = "Cancel")
+                            }
+                        }
+                    )
+                }
+            }
+
+            items(downloads, key = { it.id }) { song ->
+                var showMenu by remember { mutableStateOf(false) }
+                var showDetails by remember { mutableStateOf(false) }
                 SongListItem(
                     song = song,
                     onClick = { onSongClick(song) },
-                    onMoreClick = { onDeleteDownload(song.id) }
+                    onMoreClick = { showMenu = true },
+                    trailing = {
+                        Box {
+                            DropdownMenu(
+                                expanded = showMenu,
+                                onDismissRequest = { showMenu = false }
+                            ) {
+                                DropdownMenuItem(
+                                    text = { Text("View Details") },
+                                    onClick = {
+                                        showDetails = true
+                                        showMenu = false
+                                    },
+                                    leadingIcon = {
+                                        Icon(Icons.Default.Info, contentDescription = null)
+                                    }
+                                )
+
+                                DropdownMenuItem(
+                                    text = { Text("Delete Download") },
+                                    onClick = {
+                                        onDeleteDownload(song.id)
+                                        showMenu = false
+                                    },
+                                    leadingIcon = {
+                                        Icon(Icons.Outlined.Delete, contentDescription = null)
+                                    }
+                                )
+                            }
+                        }
+                    }
                 )
+
+                if (showDetails) {
+                    val songSize = downloadSizeMap[song.id]
+                    AlertDialog(
+                        onDismissRequest = { showDetails = false },
+                        title = { Text("Download Details") },
+                        text = {
+                            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                Text("Title: ${song.title}")
+                                Text("Artist: ${song.artistsText}")
+                                Text("Size: ${songSize?.let(::formatBytes) ?: "--"}")
+                                Text("Path: ${song.localPath ?: "Unavailable"}")
+                            }
+                        },
+                        confirmButton = {
+                            TextButton(onClick = { showDetails = false }) {
+                                Text("Close")
+                            }
+                        }
+                    )
+                }
             }
             item {
                 Spacer(modifier = Modifier.height(100.dp))
@@ -278,23 +402,9 @@ private fun DownloadsTab(
 @Composable
 private fun HistoryTab(
     history: List<com.beatloop.music.data.model.SongItem>,
-    onSongClick: (com.beatloop.music.data.model.SongItem) -> Unit,
-    onClearHistory: () -> Unit
+    onSongClick: (com.beatloop.music.data.model.SongItem) -> Unit
 ) {
     Column(modifier = Modifier.fillMaxSize()) {
-        if (history.isNotEmpty()) {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 16.dp, vertical = 8.dp),
-                horizontalArrangement = Arrangement.End
-            ) {
-                TextButton(onClick = onClearHistory) {
-                    Text("Clear history")
-                }
-            }
-        }
-        
         if (history.isEmpty()) {
             EmptyState(
                 icon = Icons.Default.History,
@@ -338,11 +448,31 @@ private fun LikedSongsTab(
             modifier = Modifier.fillMaxSize(),
             contentPadding = PaddingValues(vertical = 8.dp)
         ) {
-            items(likedSongs) { song ->
+            items(likedSongs, key = { it.id }) { song ->
+                var showMenu by remember { mutableStateOf(false) }
                 SongListItem(
                     song = song,
                     onClick = { onSongClick(song) },
-                    onMoreClick = { onUnlike(song.id) }
+                    onMoreClick = { showMenu = true },
+                    trailing = {
+                        Box {
+                            DropdownMenu(
+                                expanded = showMenu,
+                                onDismissRequest = { showMenu = false }
+                            ) {
+                                DropdownMenuItem(
+                                    text = { Text("Unlike") },
+                                    onClick = {
+                                        onUnlike(song.id)
+                                        showMenu = false
+                                    },
+                                    leadingIcon = {
+                                        Icon(Icons.Default.FavoriteBorder, contentDescription = null)
+                                    }
+                                )
+                            }
+                        }
+                    }
                 )
             }
             item {
@@ -385,4 +515,14 @@ private fun EmptyState(
             )
         }
     }
+}
+
+private fun formatBytes(bytes: Long): String {
+    if (bytes < 1024L) return "$bytes B"
+    val kb = bytes / 1024.0
+    if (kb < 1024.0) return String.format("%.1f KB", kb)
+    val mb = kb / 1024.0
+    if (mb < 1024.0) return String.format("%.2f MB", mb)
+    val gb = mb / 1024.0
+    return String.format("%.2f GB", gb)
 }

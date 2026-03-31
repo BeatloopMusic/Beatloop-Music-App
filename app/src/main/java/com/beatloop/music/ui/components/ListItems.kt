@@ -220,18 +220,30 @@ fun AlbumCard(
             }
             
             Column(
-                modifier = Modifier.padding(12.dp)
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(Color.White.copy(alpha = 0.05f))
+                    .padding(12.dp)
             ) {
                 Text(
                     text = album.title,
-                    style = MaterialTheme.typography.titleSmall,
+                    style = MaterialTheme.typography.titleMedium,
                     color = MaterialTheme.colorScheme.onSurface,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
                 )
+                val albumInfoText = buildString {
+                    if (album.songCount != null) {
+                        append("${album.songCount} songs")
+                    }
+                    if (album.artistsText.isNotEmpty()) {
+                        if (isNotEmpty()) append(" • ")
+                        append(album.artistsText)
+                    }
+                }
                 Text(
-                    text = album.artistsText,
-                    style = MaterialTheme.typography.labelMedium,
+                    text = albumInfoText,
+                    style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
@@ -284,19 +296,31 @@ fun PlaylistCard(
             }
             
             Column(
-                modifier = Modifier.padding(12.dp)
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(Color.White.copy(alpha = 0.05f))
+                    .padding(12.dp)
             ) {
                 Text(
                     text = playlist.title,
-                    style = MaterialTheme.typography.titleSmall,
+                    style = MaterialTheme.typography.titleMedium,
                     color = MaterialTheme.colorScheme.onSurface,
                     maxLines = 2,
                     overflow = TextOverflow.Ellipsis
                 )
-                playlist.author?.let { author ->
+                val infoText = buildString {
+                    if (playlist.songCount != null) {
+                        append("${playlist.songCount} songs")
+                    }
+                    if (playlist.author != null) {
+                        if (isNotEmpty()) append(" • ")
+                        append(playlist.author)
+                    }
+                }
+                if (infoText.isNotEmpty()) {
                     Text(
-                        text = author,
-                        style = MaterialTheme.typography.labelMedium,
+                        text = infoText,
+                        style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
@@ -372,18 +396,21 @@ fun SongCard(
             }
             
             Column(
-                modifier = Modifier.padding(12.dp)
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(Color.White.copy(alpha = 0.05f))
+                    .padding(12.dp)
             ) {
                 Text(
                     text = song.title,
-                    style = MaterialTheme.typography.titleSmall,
+                    style = MaterialTheme.typography.titleMedium,
                     color = MaterialTheme.colorScheme.onSurface,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
                 )
                 Text(
                     text = song.artistsText,
-                    style = MaterialTheme.typography.labelMedium,
+                    style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
@@ -410,9 +437,10 @@ fun ArtistCard(
         elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
     ) {
         Column(
-            horizontalAlignment = Alignment.CenterHorizontally,
-            modifier = Modifier.padding(16.dp)
+            horizontalAlignment = Alignment.CenterHorizontally
         ) {
+            Spacer(modifier = Modifier.height(16.dp))
+            
             AsyncImage(
                 model = artist.thumbnailUrl,
                 contentDescription = null,
@@ -421,16 +449,25 @@ fun ArtistCard(
                     .clip(CircleShape),
                 contentScale = ContentScale.Crop
             )
-            
+
             Spacer(modifier = Modifier.height(12.dp))
-            
-            Text(
-                text = artist.name,
-                style = MaterialTheme.typography.titleSmall,
-                color = MaterialTheme.colorScheme.onSurface,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
-            )
-        }
+
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(Color.White.copy(alpha = 0.05f))
+                    .padding(vertical = 12.dp, horizontal = 12.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Text(
+                    text = artist.name,
+                    style = MaterialTheme.typography.titleMedium,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
     }
+}
+
 }

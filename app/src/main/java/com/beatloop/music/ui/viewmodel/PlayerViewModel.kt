@@ -17,6 +17,8 @@ data class PlayerUiState(
     val isLoadingLyrics: Boolean = false,
     val lyricsError: String? = null,
     val isLiked: Boolean = false,
+    val isDownloaded: Boolean = false,
+    val downloadedFileSizeBytes: Long? = null,
     val currentQueueIndex: Int = 0,
     val videoVotes: VideoVotes? = null,
     val isLoadingVideoVotes: Boolean = false,
@@ -26,8 +28,28 @@ data class PlayerUiState(
 @HiltViewModel
 class PlayerViewModel @Inject constructor(
     private val lyricsRepository: LyricsRepository,
-    private val musicRepository: MusicRepository
+    private val musicRepository: MusicRepository,
+    private val preferencesManager: com.beatloop.music.data.preferences.PreferencesManager
 ) : ViewModel() {
+
+    val preferredVideoQuality = preferencesManager.videoPlaybackQuality.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(5000),
+        initialValue = 360
+    )
+
+    val isQueueLocked = preferencesManager.queueLocked.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(5000),
+        initialValue = false
+    )
+
+    fun toggleQueueLock() {
+        viewModelScope.launch {
+            val current = isQueueLocked.value
+            preferencesManager.setQueueLocked(!current)
+        }
+    }
     
     private val _uiState = MutableStateFlow(PlayerUiState())
     val uiState: StateFlow<PlayerUiState> = _uiState.asStateFlow()
@@ -86,6 +108,18 @@ class PlayerViewModel @Inject constructor(
         viewModelScope.launch {
             val isLiked = musicRepository.isSongLiked(songId)
             _uiState.update { it.copy(isLiked = isLiked) }
+        }
+    }
+
+    fun checkDownloadStatus(songId: String) {
+        viewModelScope.launch {
+            val downloaded = musicRepository.getDownloadedSong(songId)
+            _uiState.update {
+                it.copy(
+                    isDownloaded = downloaded != null,
+                    downloadedFileSizeBytes = downloaded?.fileSize
+                )
+            }
         }
     }
     
@@ -162,6 +196,8 @@ class PlayerViewModel @Inject constructor(
             it.copy(
                 lyrics = null,
                 lyricsError = null,
+                isDownloaded = false,
+                downloadedFileSizeBytes = null,
                 videoVotes = null,
                 isLoadingVideoVotes = false,
                 videoVotesError = null

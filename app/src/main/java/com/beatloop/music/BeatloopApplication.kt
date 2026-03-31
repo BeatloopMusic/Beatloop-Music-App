@@ -4,23 +4,53 @@ import android.app.Application
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.os.Build
+import androidx.hilt.work.HiltWorkerFactory
+import androidx.work.Configuration
 import coil.ImageLoader
 import coil.ImageLoaderFactory
 import coil.disk.DiskCache
 import coil.memory.MemoryCache
 import coil.request.CachePolicy
+import com.beatloop.music.data.auth.AuthManager
+import com.beatloop.music.sync.SyncScheduler
 import dagger.hilt.android.HiltAndroidApp
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import javax.inject.Inject
 
 @HiltAndroidApp
-class BeatloopApplication : Application(), ImageLoaderFactory {
-    
+class BeatloopApplication : Application(), ImageLoaderFactory, Configuration.Provider {
+
     @Inject
     lateinit var imageLoader: ImageLoader
+
+    @Inject
+    lateinit var workerFactory: HiltWorkerFactory
+
+    @Inject
+    lateinit var authManager: AuthManager
+
+    @Inject
+    lateinit var syncScheduler: SyncScheduler
+
+    private val applicationScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    override val workManagerConfiguration: Configuration
+        get() = Configuration.Builder()
+            .setWorkerFactory(workerFactory)
+            .build()
     
     override fun onCreate() {
         super.onCreate()
         createNotificationChannels()
+
+        applicationScope.launch {
+            authManager.ensureSession()
+            syncScheduler.schedulePeriodicSync()
+            syncScheduler.enqueueImmediateSync()
+        }
     }
     
     private fun createNotificationChannels() {

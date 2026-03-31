@@ -65,8 +65,8 @@ class BeatloopAppWidgetProvider : AppWidgetProvider() {
             )
             views.setImageViewResource(
                 R.id.widgetLike,
-                if (snapshot.isLiked) android.R.drawable.btn_star_big_on
-                else android.R.drawable.btn_star_big_off
+                if (snapshot.isLiked) R.drawable.ic_heart_filled
+                else R.drawable.ic_heart_outline
             )
 
             views.setOnClickPendingIntent(
@@ -123,9 +123,16 @@ class BeatloopAppWidgetProvider : AppWidgetProvider() {
 
         private fun controlPendingIntent(context: Context, action: String): PendingIntent {
             val intent = Intent(context, PlaybackControlReceiver::class.java).setAction(action)
+            val requestCode = when (action) {
+                PlaybackControlContract.ACTION_PREVIOUS -> 3001
+                PlaybackControlContract.ACTION_PLAY_PAUSE -> 3002
+                PlaybackControlContract.ACTION_NEXT -> 3003
+                PlaybackControlContract.ACTION_TOGGLE_LIKE -> 3004
+                else -> 3999
+            }
             return PendingIntent.getBroadcast(
                 context,
-                action.hashCode(),
+                requestCode,
                 intent,
                 PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
             )

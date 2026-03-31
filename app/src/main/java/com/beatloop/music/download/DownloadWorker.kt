@@ -41,6 +41,12 @@ class DownloadWorker @AssistedInject constructor(
         const val KEY_SONG_TITLE = "song_title"
         const val KEY_SONG_ARTIST = "song_artist"
         const val KEY_THUMBNAIL_URL = "thumbnail_url"
+        const val KEY_PROGRESS = "progress"
+        const val KEY_DOWNLOADED_BYTES = "downloaded_bytes"
+        const val KEY_TOTAL_BYTES = "total_bytes"
+        const val KEY_FILE_SIZE = "file_size"
+        const val KEY_DOWNLOAD_VIDEO = "download_video"
+        const val KEY_VIDEO_QUALITY = "video_quality"
         
         const val CHANNEL_ID = "download_channel"
         const val NOTIFICATION_ID = 2000
@@ -49,13 +55,17 @@ class DownloadWorker @AssistedInject constructor(
             songId: String,
             title: String,
             artist: String,
-            thumbnailUrl: String?
+            thumbnailUrl: String?,
+            downloadVideo: Boolean = false,
+            videoQuality: Int = 360
         ): OneTimeWorkRequest {
             val data = workDataOf(
                 KEY_SONG_ID to songId,
                 KEY_SONG_TITLE to title,
                 KEY_SONG_ARTIST to artist,
-                KEY_THUMBNAIL_URL to thumbnailUrl
+                KEY_THUMBNAIL_URL to thumbnailUrl,
+                KEY_DOWNLOAD_VIDEO to downloadVideo,
+                KEY_VIDEO_QUALITY to videoQuality
             )
             
             return OneTimeWorkRequestBuilder<DownloadWorker>()
@@ -75,6 +85,13 @@ class DownloadWorker @AssistedInject constructor(
         val title = inputData.getString(KEY_SONG_TITLE) ?: "Unknown"
         val artist = inputData.getString(KEY_SONG_ARTIST) ?: "Unknown"
         val thumbnailUrl = inputData.getString(KEY_THUMBNAIL_URL)
+        val downloadVideo = inputData.getBoolean(KEY_DOWNLOAD_VIDEO, false)
+        val videoQuality = inputData.getInt(KEY_VIDEO_QUALITY, 360).let {
+            when (it) {
+                144, 240, 360, 480, 720 -> it
+                else -> 360
+            }
+        }
 
         // Ensure the song row exists and mark download as started.
         val existingSong = database.songDao().getSongById(songId)
@@ -94,10 +111,15 @@ class DownloadWorker @AssistedInject constructor(
         
         try {
             // Show progress notification
-            setForeground(createForegroundInfo(title))
+            setForeground(createForegroundInfo(title, progress = 0, downloadedBytes = 0L, totalBytes = null))
             
             // Get stream URL
-            val streamUrl = musicRepository.getStreamUrl(songId).getOrNull()
+            val streamUrl = if (downloadVideo) {
+                musicRepository.getVideoStreamUrl(songId, targetVideoHeight = videoQuality).getOrNull()
+                    ?: musicRepository.getStreamUrl(songId).getOrNull()
+            } else {
+                musicRepository.getStreamUrl(songId).getOrNull()
+            }
                 ?: run {
                     database.songDao().updateDownloadState(songId, DownloadState.FAILED, null)
                     return@withContext Result.failure()
@@ -109,9 +131,24 @@ class DownloadWorker @AssistedInject constructor(
                 downloadsDir.mkdirs()
             }
             
-            // Download the audio file
-            val audioFile = File(downloadsDir, "$songId.m4a")
-            downloadFile(streamUrl, audioFile)
+            // Download the audio file with progress updates.
+            val mediaFile = File(downloadsDir, if (downloadVideo) "$songId.mp4" else "$songId.m4a")
+            downloadFile(streamUrl, mediaFile) { downloadedBytes, totalBytes ->
+                val progress = if (totalBytes > 0L) {
+                    ((downloadedBytes * 100L) / totalBytes).toInt().coerceIn(0, 100)
+                } else {
+                    0
+                }
+
+                setProgressAsync(
+                    workDataOf(
+                        KEY_PROGRESS to progress,
+                        KEY_DOWNLOADED_BYTES to downloadedBytes,
+                        KEY_TOTAL_BYTES to totalBytes
+                    )
+                )
+                setForegroundAsync(createForegroundInfo(title, progress, downloadedBytes, totalBytes))
+            }
             
             // Download thumbnail
             var thumbnailPath: String? = null
@@ -131,27 +168,41 @@ class DownloadWorker @AssistedInject constructor(
                 title = title,
                 artist = artist,
                 thumbnailUrl = thumbnailUrl,
-                filePath = audioFile.absolutePath,
+                filePath = mediaFile.absolutePath,
                 thumbnailPath = thumbnailPath,
                 downloadedAt = System.currentTimeMillis(),
-                fileSize = audioFile.length()
+                fileSize = mediaFile.length()
             )
             
             database.downloadedSongDao().insert(downloadedSong)
-            database.songDao().updateDownloadState(songId, DownloadState.DOWNLOADED, audioFile.absolutePath)
+            database.songDao().updateDownloadState(songId, DownloadState.DOWNLOADED, mediaFile.absolutePath)
+
+            setProgressAsync(
+                workDataOf(
+                    KEY_PROGRESS to 100,
+                    KEY_DOWNLOADED_BYTES to mediaFile.length(),
+                    KEY_TOTAL_BYTES to mediaFile.length(),
+                    KEY_FILE_SIZE to mediaFile.length()
+                )
+            )
             
             // Show completion notification
             showCompletionNotification(title)
             
-            Result.success()
+            Result.success(workDataOf(KEY_FILE_SIZE to mediaFile.length(), KEY_PROGRESS to 100))
         } catch (e: Exception) {
             e.printStackTrace()
             database.songDao().updateDownloadState(songId, DownloadState.FAILED, null)
+            setProgressAsync(workDataOf(KEY_PROGRESS to 0))
             Result.retry()
         }
     }
     
-    private suspend fun downloadFile(url: String, destination: File) {
+    private suspend fun downloadFile(
+        url: String,
+        destination: File,
+        onProgress: ((downloadedBytes: Long, totalBytes: Long) -> Unit)? = null
+    ) {
         val request = Request.Builder()
             .url(url)
             .build()
@@ -173,19 +224,20 @@ class DownloadWorker @AssistedInject constructor(
                     while (input.read(buffer).also { bytesRead = it } != -1) {
                         output.write(buffer, 0, bytesRead)
                         totalBytesRead += bytesRead
-                        
-                        // Update progress
-                        if (contentLength > 0) {
-                            val progress = (totalBytesRead * 100 / contentLength).toInt()
-                            setProgressAsync(workDataOf("progress" to progress))
-                        }
+
+                        onProgress?.invoke(totalBytesRead, contentLength)
                     }
                 }
             }
         }
     }
     
-    private fun createForegroundInfo(songTitle: String): ForegroundInfo {
+    private fun createForegroundInfo(
+        songTitle: String,
+        progress: Int,
+        downloadedBytes: Long,
+        totalBytes: Long?
+    ): ForegroundInfo {
         val intent = Intent(context, MainActivity::class.java)
         val pendingIntent = PendingIntent.getActivity(
             context,
@@ -193,17 +245,24 @@ class DownloadWorker @AssistedInject constructor(
             intent,
             PendingIntent.FLAG_IMMUTABLE
         )
+
+        val progressText = if (totalBytes != null && totalBytes > 0L) {
+            "${progress.coerceIn(0, 100)}% • ${formatBytes(downloadedBytes)} / ${formatBytes(totalBytes)}"
+        } else {
+            "Preparing download..."
+        }
         
         val notification = NotificationCompat.Builder(context, CHANNEL_ID)
             .setContentTitle("Downloading")
-            .setContentText(songTitle)
+            .setContentText("$songTitle • $progressText")
             .setSmallIcon(R.drawable.ic_download)
             .setOngoing(true)
-            .setProgress(100, 0, true)
+            .setOnlyAlertOnce(true)
+            .setProgress(100, progress.coerceIn(0, 100), totalBytes == null || totalBytes <= 0L)
             .setContentIntent(pendingIntent)
             .build()
         
-        return ForegroundInfo(NOTIFICATION_ID, notification)
+        return ForegroundInfo(NOTIFICATION_ID, notification, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
     }
     
     private fun showCompletionNotification(songTitle: String) {
@@ -231,5 +290,15 @@ class DownloadWorker @AssistedInject constructor(
         } catch (e: SecurityException) {
             // Handle notification permission not granted
         }
+    }
+
+    private fun formatBytes(bytes: Long): String {
+        if (bytes < 1024L) return "$bytes B"
+        val kb = bytes / 1024.0
+        if (kb < 1024.0) return String.format("%.1f KB", kb)
+        val mb = kb / 1024.0
+        if (mb < 1024.0) return String.format("%.2f MB", mb)
+        val gb = mb / 1024.0
+        return String.format("%.2f GB", gb)
     }
 }

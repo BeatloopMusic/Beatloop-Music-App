@@ -73,7 +73,7 @@
             android:layout_marginStart="8dp"
             android:background="@android:color/transparent"
             android:contentDescription="Like"
-            android:src="@android:drawable/btn_star_big_off"
+            android:src="@drawable/ic_heart_outline"
             app:tint="@android:color/white" />
     </LinearLayout>
 </LinearLayout>

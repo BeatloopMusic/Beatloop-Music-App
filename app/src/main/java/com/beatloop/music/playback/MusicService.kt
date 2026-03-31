@@ -14,6 +14,7 @@ import androidx.media3.common.PlaybackException
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DataSource
 import androidx.media3.datasource.DataSpec
+import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.datasource.ResolvingDataSource
 import androidx.media3.datasource.cache.CacheDataSource
@@ -27,6 +28,7 @@ import androidx.media3.session.MediaSessionService
 import androidx.media3.session.SessionCommand
 import androidx.media3.session.SessionResult
 import com.beatloop.music.MainActivity
+import com.beatloop.music.R
 import com.beatloop.music.controls.PlaybackControlContract
 import com.beatloop.music.controls.PlaybackControlStateStore
 import com.beatloop.music.data.model.SearchFilter
@@ -52,6 +54,18 @@ class MusicService : MediaSessionService() {
     private data class MediaHints(
         val title: String,
         val artist: String
+    )
+
+    private data class ActivePlaybackSession(
+        val songId: String,
+        val title: String,
+        val artist: String,
+        val thumbnailUrl: String?,
+        val startedAtMs: Long,
+        val previousSongId: String? = null,
+        var lastResumeAtMs: Long? = null,
+        var listenedMs: Long = 0L,
+        var lastKnownDurationMs: Long? = null
     )
     
     @Inject lateinit var musicRepository: MusicRepository
@@ -79,12 +93,19 @@ class MusicService : MediaSessionService() {
     private var queueAutoFillJob: Job? = null
     private var lastAutoFillSeedId: String? = null
     private var lastAutoFillAtMs: Long = 0L
+    private var activePlaybackSession: ActivePlaybackSession? = null
+    private var playbackTrackingJob: Job? = null
     
     override fun onCreate() {
         super.onCreate()
         initializeCache()
         initializePlayer()
         initializeSession()
+        restorePlaybackSnapshot()
+        player?.currentMediaItem?.let { item ->
+            beginPlaybackSession(item = item, previousSongId = null)
+        }
+        startPlaybackTrackingLoop()
         refreshPlaybackControlState()
     }
     
@@ -126,16 +147,17 @@ class MusicService : MediaSessionService() {
             .setReadTimeoutMs(30000)
             .setAllowCrossProtocolRedirects(true)
         
+        val defaultDataSourceFactory = DefaultDataSource.Factory(this, httpDataSourceFactory)
+
         val cacheDataSourceFactory = CacheDataSource.Factory()
             .setCache(cache!!)
-            .setUpstreamDataSourceFactory(httpDataSourceFactory)
+            .setUpstreamDataSourceFactory(defaultDataSourceFactory)
             .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
-        
+
         return ResolvingDataSource.Factory(cacheDataSourceFactory) { dataSpec ->
             resolveDataSpec(dataSpec)
         }
     }
-    
     /**
      * Resolves a DataSpec by fetching the actual stream URL if needed.
      * This runs on the ExoPlayer's loading thread, not the main thread.
@@ -147,10 +169,13 @@ class MusicService : MediaSessionService() {
         // Check if this is a beatloop:// URI that needs resolution
         if (uri.scheme == "beatloop") {
             val videoId = uri.lastPathSegment ?: return dataSpec
+            val mode = uri.host ?: "song"
+            val requestedQuality = uri.getQueryParameter("quality")?.toIntOrNull() ?: 360
+            val cacheKey = if (mode == "video") "$videoId#video#$requestedQuality" else videoId
             Log.d(TAG, "Resolving stream URL for: $videoId")
             
             // Check cache first (URLs expire after ~6 hours from YouTube)
-            val cachedEntry = streamUrlCache[videoId]
+            val cachedEntry = streamUrlCache[cacheKey]
             if (cachedEntry != null && cachedEntry.second > System.currentTimeMillis()) {
                 Log.d(TAG, "Using cached stream URL for: $videoId")
                 return dataSpec.withUri(cachedEntry.first.toUri())
@@ -158,13 +183,24 @@ class MusicService : MediaSessionService() {
             
             // Resolve the stream URL synchronously (this is on ExoPlayer's loading thread)
             val streamUrl = runBlocking(Dispatchers.IO) {
-                musicRepository.getStreamUrl(videoId).getOrNull()
+                if (mode == "video") {
+                    val qualityCandidates = buildList {
+                        add(requestedQuality)
+                        addAll(listOf(480, 360, 240, 144))
+                    }.distinct()
+
+                    qualityCandidates.firstNotNullOfOrNull { quality ->
+                        musicRepository.getVideoStreamUrl(videoId, quality).getOrNull()
+                    }
+                } else {
+                    musicRepository.getStreamUrl(videoId).getOrNull()
+                }
             }
             
             if (streamUrl != null) {
                 // Cache the URL with 5 hour expiration (YouTube URLs typically expire after 6 hours)
                 val expiry = System.currentTimeMillis() + 5 * 60 * 60 * 1000
-                streamUrlCache[videoId] = streamUrl to expiry
+                streamUrlCache[cacheKey] = streamUrl to expiry
                 if (mediaId != videoId) {
                     streamUrlCache[mediaId] = streamUrl to expiry
                 }
@@ -175,16 +211,20 @@ class MusicService : MediaSessionService() {
                 val titleHint = cachedHints?.title.orEmpty().ifBlank { currentSongTitleHint }
                 val artistHint = cachedHints?.artist.orEmpty().ifBlank { currentSongArtistHint }
                 val alternativeUrl = runBlocking(Dispatchers.IO) {
-                    tryResolveAlternativeStreamUrl(
-                        videoId = videoId,
-                        mediaId = mediaId,
-                        titleHint = titleHint,
-                        artistHint = artistHint
-                    )
+                    if (mode == "video") {
+                        null
+                    } else {
+                        tryResolveAlternativeStreamUrl(
+                            videoId = videoId,
+                            mediaId = mediaId,
+                            titleHint = titleHint,
+                            artistHint = artistHint
+                        )
+                    }
                 }
                 if (isLikelyStreamUrl(alternativeUrl)) {
                     val expiry = System.currentTimeMillis() + 5 * 60 * 60 * 1000
-                    streamUrlCache[videoId] = alternativeUrl!! to expiry
+                    streamUrlCache[cacheKey] = alternativeUrl!! to expiry
                     if (mediaId != videoId) {
                         streamUrlCache[mediaId] = alternativeUrl to expiry
                     }
@@ -262,7 +302,17 @@ class MusicService : MediaSessionService() {
         if (queueAutoFillJob?.isActive == true) return
 
         queueAutoFillJob = serviceScope.launch {
+            if (preferencesManager.queueLocked.first()) {
+                return@launch
+            }
+
             val playerInstance = player ?: return@launch
+            
+            // Respect repeat modes - do not auto-fill if user explicitly looping
+            if (!force && playerInstance.repeatMode != androidx.media3.common.Player.REPEAT_MODE_OFF) {
+                return@launch
+            }
+            
             val mediaCount = playerInstance.mediaItemCount
             val currentIndex = playerInstance.currentMediaItemIndex.coerceAtLeast(0)
             val remainingItems = (mediaCount - currentIndex - 1).coerceAtLeast(0)
@@ -332,44 +382,64 @@ class MusicService : MediaSessionService() {
         existingIds: Set<String>
     ): List<SongItem> {
         val seedId = seedMediaItem?.mediaId.orEmpty()
-        val seedTitle = seedMediaItem?.mediaMetadata?.title?.toString().orEmpty().ifBlank { currentSongTitleHint }
-        val seedArtist = seedMediaItem?.mediaMetadata?.artist?.toString().orEmpty().ifBlank { currentSongArtistHint }
-
         val collected = mutableListOf<SongItem>()
 
-        if (seedId.isNotBlank()) {
+        if (seedId.isNotBlank() && !seedId.startsWith("content://") && !seedId.startsWith("file://")) {
             collected += musicRepository.getRelatedSongs(seedId).getOrDefault(emptyList())
         }
 
         if (collected.size < 10) {
-            val query = listOf(seedTitle, seedArtist)
-                .filter { it.isNotBlank() }
-                .joinToString(" ")
-                .trim()
-
-            if (query.isNotBlank()) {
-                val searchSongs = musicRepository.search(query, SearchFilter.Songs)
-                    .getOrNull()
-                    ?.songs
-                    .orEmpty()
-                collected += searchSongs
+            val home = runCatching { musicRepository.getHome().getOrNull() }.getOrNull()
+            home?.let {
+                collected += it.quickPicks
+                collected += it.personalizedRecommendations
             }
         }
 
         if (collected.size < 10) {
-            val historySongs = runCatching { musicRepository.getPlayHistory().first() }
-                .getOrDefault(emptyList())
+            val historySongs = runCatching { musicRepository.getPlayHistory().first() }.getOrDefault(emptyList())
             collected += historySongs
         }
 
-        return collected
-            .filter { candidate ->
-                candidate.id.isNotBlank() && !existingIds.contains(candidate.id)
+        if (collected.size < 10 && existingIds.isNotEmpty()) {
+            val randomSeed = existingIds.shuffled().firstOrNull { it.isNotBlank() && it != seedId }
+            if (randomSeed != null && !randomSeed.startsWith("content://") && !randomSeed.startsWith("file://")) {
+                collected += musicRepository.getRelatedSongs(randomSeed).getOrDefault(emptyList())
             }
+        }
+
+        return collected
+            .filter { it.id.isNotBlank() && !existingIds.contains(it.id) }
             .distinctBy { it.id }
-            .take(20)
+            .let { rawCandidates ->
+                if (rawCandidates.isEmpty()) {
+                    emptyList()
+                } else {
+                    val predicted = runCatching {
+                        musicRepository.predictNextSongs(
+                            seedSongId = seedId.takeUnless {
+                                it.isBlank() || it.startsWith("content://") || it.startsWith("file://")
+                            },
+                            candidates = rawCandidates,
+                            queueSongIds = existingIds,
+                            limit = 20
+                        )
+                    }.getOrElse { error ->
+                        Log.w(TAG, "Next-song prediction failed, using fallback ordering", error)
+                        rawCandidates.take(20)
+                    }
+
+                    val finalCandidates = predicted.ifEmpty { rawCandidates }.take(20)
+                    runCatching {
+                        musicRepository.recordRecommendationImpressions(
+                            songs = finalCandidates,
+                            surface = "queue_autofill"
+                        )
+                    }
+                    finalCandidates
+                }
+            }
     }
-    
     private fun initializeSession() {
         val intent = Intent(this, MainActivity::class.java)
         val pendingIntent = PendingIntent.getActivity(
@@ -387,26 +457,38 @@ class MusicService : MediaSessionService() {
     
     private val playerListener = object : Player.Listener {
         override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
+            val nextSongId = mediaItem?.mediaId?.takeIf { it.isNotBlank() }
+            val previousSongId = finalizeActivePlaybackSession(
+                nextSongId = nextSongId,
+                source = transitionReasonLabel(reason)
+            )
+
             mediaItem?.let { item ->
                 currentSongTitleHint = item.mediaMetadata.title?.toString().orEmpty()
                 currentSongArtistHint = item.mediaMetadata.artist?.toString().orEmpty()
                 cacheMediaHints(item)
                 playbackRetryAttempts.remove(item.mediaId)
                 loadSponsorBlockSegments(item.mediaId)
-                trackPlaybackAnalytics(item)
+                beginPlaybackSession(item = item, previousSongId = previousSongId)
+                trackPlaybackAnalytics(item, reason)
                 refreshPlaybackControlState()
             }
 
             maybeAutoFillQueue(reasonLabel = "transition", force = false)
+            persistPlaybackSnapshot()
         }
         
         override fun onIsPlayingChanged(isPlaying: Boolean) {
             if (isPlaying) {
+                ensureActiveSessionForCurrentItem()
+                markPlaybackResumed()
                 startSegmentSkipping()
             } else {
+                markPlaybackPaused()
                 stopSegmentSkipping()
             }
             refreshPlaybackControlState()
+            persistPlaybackSnapshot()
         }
 
         override fun onPlayerError(error: PlaybackException) {
@@ -447,14 +529,179 @@ class MusicService : MediaSessionService() {
 
         override fun onPlaybackStateChanged(playbackState: Int) {
             if (playbackState == Player.STATE_ENDED) {
+                finalizeActivePlaybackSession(nextSongId = null, source = "ended")
                 maybeAutoFillQueue(reasonLabel = "ended", force = true)
+            }
+            persistPlaybackSnapshot()
+        }
+    }
+
+    private fun startPlaybackTrackingLoop() {
+        playbackTrackingJob?.cancel()
+        playbackTrackingJob = serviceScope.launch {
+            while (isActive) {
+                val session = activePlaybackSession
+                val playerInstance = player
+                if (session != null && playerInstance != null) {
+                    val currentId = playerInstance.currentMediaItem?.mediaId
+                    if (currentId == session.songId) {
+                        val duration = playerInstance.duration
+                        if (duration > 0) {
+                            session.lastKnownDurationMs = duration
+                        }
+                    }
+                }
+                delay(1000)
             }
         }
     }
 
-    private fun trackPlaybackAnalytics(item: MediaItem) {
+    private fun ensureActiveSessionForCurrentItem() {
+        val item = player?.currentMediaItem ?: return
+        if (activePlaybackSession?.songId == item.mediaId) {
+            return
+        }
+        beginPlaybackSession(item = item, previousSongId = null)
+    }
+
+    private fun beginPlaybackSession(item: MediaItem, previousSongId: String?) {
         val songId = item.mediaId
-        if (songId.isBlank() || songId == lastTrackedMediaId) return
+        if (songId.isBlank()) return
+
+        val current = activePlaybackSession
+        if (current?.songId == songId) {
+            if (current.lastResumeAtMs == null && player?.isPlaying == true) {
+                current.lastResumeAtMs = System.currentTimeMillis()
+            }
+            return
+        }
+
+        val now = System.currentTimeMillis()
+        val duration = player?.duration?.takeIf { it > 0L }
+        activePlaybackSession = ActivePlaybackSession(
+            songId = songId,
+            title = item.mediaMetadata.title?.toString().orEmpty().ifBlank { "Unknown" },
+            artist = item.mediaMetadata.artist?.toString().orEmpty().ifBlank { "Unknown" },
+            thumbnailUrl = item.mediaMetadata.artworkUri?.toString(),
+            startedAtMs = now,
+            previousSongId = previousSongId,
+            lastResumeAtMs = if (player?.isPlaying == true) now else null,
+            lastKnownDurationMs = duration
+        )
+    }
+
+    private fun markPlaybackResumed() {
+        val session = activePlaybackSession ?: return
+        if (session.lastResumeAtMs == null) {
+            session.lastResumeAtMs = System.currentTimeMillis()
+        }
+    }
+
+    private fun markPlaybackPaused() {
+        val session = activePlaybackSession ?: return
+        val resumeAt = session.lastResumeAtMs ?: return
+        val now = System.currentTimeMillis()
+        session.listenedMs += (now - resumeAt).coerceAtLeast(0L)
+        session.lastResumeAtMs = null
+    }
+
+    private fun finalizeActivePlaybackSession(nextSongId: String?, source: String): String? {
+        val session = activePlaybackSession ?: return null
+        activePlaybackSession = null
+
+        val now = System.currentTimeMillis()
+        val resumeAt = session.lastResumeAtMs
+        val listenedMs = session.listenedMs + if (resumeAt != null) {
+            (now - resumeAt).coerceAtLeast(0L)
+        } else {
+            0L
+        }
+
+        serviceScope.launch(Dispatchers.IO) {
+            runCatching {
+                musicRepository.recordListeningSession(
+                    songId = session.songId,
+                    playedAt = session.startedAtMs,
+                    listenedMs = listenedMs,
+                    trackDurationMs = session.lastKnownDurationMs,
+                    previousSongId = session.previousSongId,
+                    nextSongId = nextSongId,
+                    source = source
+                )
+            }.onFailure { error ->
+                Log.w(TAG, "Failed to record listening session for ${session.songId}", error)
+            }
+        }
+
+        return session.songId
+    }
+
+    private fun transitionReasonLabel(reason: Int): String {
+        return when (reason) {
+            Player.MEDIA_ITEM_TRANSITION_REASON_AUTO -> "transition_auto"
+            Player.MEDIA_ITEM_TRANSITION_REASON_SEEK -> "transition_seek"
+            Player.MEDIA_ITEM_TRANSITION_REASON_REPEAT -> "transition_repeat"
+            Player.MEDIA_ITEM_TRANSITION_REASON_PLAYLIST_CHANGED -> "transition_playlist_changed"
+            else -> "transition"
+        }
+    }
+
+    private fun persistPlaybackSnapshot() {
+        val playerInstance = player ?: return
+        val item = playerInstance.currentMediaItem ?: return
+        val mediaId = item.mediaId
+        if (mediaId.isBlank()) return
+
+        val uri = item.localConfiguration?.uri
+        val mode = if (uri?.host == "video") "video" else "song"
+        val quality = uri?.getQueryParameter("quality")?.toIntOrNull() ?: 360
+
+        PlaybackResumeStore.save(
+            context = this,
+            snapshot = PlaybackResumeSnapshot(
+                mediaId = mediaId,
+                title = item.mediaMetadata.title?.toString().orEmpty().ifBlank { "Unknown" },
+                artist = item.mediaMetadata.artist?.toString().orEmpty().ifBlank { "Unknown" },
+                artworkUrl = item.mediaMetadata.artworkUri?.toString(),
+                positionMs = playerInstance.currentPosition,
+                mode = mode,
+                quality = quality,
+                playWhenReady = playerInstance.playWhenReady
+            )
+        )
+    }
+
+    private fun restorePlaybackSnapshot() {
+        val snapshot = PlaybackResumeStore.read(this) ?: return
+        val playerInstance = player ?: return
+        if (playerInstance.mediaItemCount > 0) return
+
+        val uri = if (snapshot.mode == "video") {
+            "beatloop://video/${snapshot.mediaId}?quality=${snapshot.quality}".toUri()
+        } else {
+            "beatloop://song/${snapshot.mediaId}".toUri()
+        }
+
+        val mediaItem = createMediaItem(
+            id = snapshot.mediaId,
+            title = snapshot.title,
+            artist = snapshot.artist,
+            thumbnailUrl = snapshot.artworkUrl,
+            localPath = null
+        ).buildUpon().setUri(uri).build()
+
+        playerInstance.setMediaItem(mediaItem)
+        playerInstance.prepare()
+        playerInstance.seekTo(snapshot.positionMs)
+        playerInstance.playWhenReady = snapshot.playWhenReady
+    }
+
+    private fun trackPlaybackAnalytics(item: MediaItem, reason: Int) {
+        val songId = item.mediaId
+        if (songId.isBlank()) return
+        if (songId == lastTrackedMediaId && reason != Player.MEDIA_ITEM_TRANSITION_REASON_REPEAT) {
+            return
+        }
 
         lastTrackedMediaId = songId
         val title = item.mediaMetadata.title?.toString().orEmpty().ifBlank { "Unknown" }
@@ -498,7 +745,7 @@ class MusicService : MediaSessionService() {
                         CommandButton.Builder()
                             .setDisplayName("Like")
                             .setSessionCommand(likeCommand)
-                            .setIconResId(android.R.drawable.btn_star_big_off)
+                            .setIconResId(R.drawable.ic_heart_outline)
                             .build()
                     )
                 )
@@ -705,13 +952,19 @@ class MusicService : MediaSessionService() {
     
     override fun onTaskRemoved(rootIntent: Intent?) {
         val player = mediaSession?.player ?: return
-        if (!player.playWhenReady || player.mediaItemCount == 0) {
+        finalizeActivePlaybackSession(nextSongId = null, source = "task_removed")
+        persistPlaybackSnapshot()
+        if (player.mediaItemCount == 0) {
             stopSelf()
         }
     }
     
     override fun onDestroy() {
         clearSleepTimer()
+        markPlaybackPaused()
+        finalizeActivePlaybackSession(nextSongId = null, source = "service_destroy")
+        persistPlaybackSnapshot()
+        playbackTrackingJob?.cancel()
         mediaSession?.run {
             player.release()
             release()

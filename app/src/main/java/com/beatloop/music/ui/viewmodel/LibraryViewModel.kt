@@ -28,6 +28,9 @@ class LibraryViewModel @Inject constructor(
     // Separate state flows for screens that need them
     val downloads: StateFlow<List<SongItem>> = musicRepository.getDownloadedSongs()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val downloadSizeMap: StateFlow<Map<String, Long>> = musicRepository.getDownloadedSongSizeMap()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyMap())
     
     val history: StateFlow<List<SongItem>> = musicRepository.getPlayHistory()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())

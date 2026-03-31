@@ -5,6 +5,7 @@ plugins {
     alias(libs.plugins.kotlin.serialization)
     alias(libs.plugins.hilt.android)
     alias(libs.plugins.ksp)
+    alias(libs.plugins.google.services)
 }
 
 android {
@@ -45,7 +46,6 @@ android {
         }
         debug {
             isMinifyEnabled = false
-            applicationIdSuffix = ".debug"
         }
     }
     
@@ -129,6 +129,12 @@ dependencies {
     // Coroutines
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.kotlinx.coroutines.core)
+    implementation(libs.kotlinx.coroutines.play.services)
+
+    // Firebase
+    implementation(platform(libs.firebase.bom))
+    implementation(libs.firebase.auth.ktx)
+    implementation(libs.firebase.firestore.ktx)
     
     // DataStore
     implementation(libs.androidx.datastore.preferences)
@@ -147,7 +153,9 @@ dependencies {
     implementation(libs.ktor.serialization.kotlinx.json)
 
     // NewPipe extractor fallback
-    implementation(libs.newpipe.extractor)
+    implementation(libs.newpipe.extractor) {
+        exclude(group = "com.google.protobuf", module = "protobuf-javalite")
+    }
 
     // Provide SLF4J runtime binding for release minification/runtime compatibility.
     implementation("org.slf4j:slf4j-nop:2.0.16")

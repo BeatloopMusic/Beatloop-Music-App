@@ -25,11 +25,14 @@ fun SongOptionsBottomSheet(
     song: SongItem,
     isLiked: Boolean = false,
     isDownloaded: Boolean = false,
+    downloadProgress: Int? = null,
+    downloadSizeBytes: Long? = null,
     onDismiss: () -> Unit,
     onPlayNext: () -> Unit,
     onAddToQueue: () -> Unit,
     onLike: () -> Unit,
     onAddToPlaylist: () -> Unit,
+    onRemoveFromPlaylist: (() -> Unit)? = null,
     onDownload: () -> Unit,
     onGoToArtist: () -> Unit,
     onGoToAlbum: () -> Unit,
@@ -76,7 +79,32 @@ fun SongOptionsBottomSheet(
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )
+
+                    val downloadStatusText = when {
+                        isDownloaded && downloadSizeBytes != null -> "Downloaded • ${formatBytes(downloadSizeBytes)}"
+                        isDownloaded -> "Downloaded"
+                        downloadProgress != null -> "Downloading • ${downloadProgress.coerceIn(0, 100)}%"
+                        else -> null
+                    }
+
+                    if (downloadStatusText != null) {
+                        Spacer(modifier = Modifier.height(2.dp))
+                        Text(
+                            text = downloadStatusText,
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                    }
                 }
+            }
+
+            if (downloadProgress != null && !isDownloaded) {
+                LinearProgressIndicator(
+                    progress = { downloadProgress.coerceIn(0, 100) / 100f },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp)
+                )
             }
             
             HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
@@ -109,19 +137,26 @@ fun SongOptionsBottomSheet(
                 }
             )
             
-            BottomSheetOption(
-                icon = Icons.Default.PlaylistAdd,
-                text = "Add to playlist",
-                onClick = {
-                    onAddToPlaylist()
-                    onDismiss()
-                }
-            )
-            
+            if (onRemoveFromPlaylist != null) {
+                BottomSheetOption(
+                    icon = Icons.Default.PlaylistRemove,
+                    text = "Remove from playlist",
+                    onClick = {
+                        onRemoveFromPlaylist()
+                        onDismiss()
+                    }
+                )
+            }
+
             BottomSheetOption(
                 icon = if (isDownloaded) Icons.Default.DownloadDone else Icons.Outlined.Download,
-                text = if (isDownloaded) "Downloaded" else "Download",
-                enabled = !isDownloaded,
+                text = when {
+                    isDownloaded && downloadSizeBytes != null -> "Downloaded (${formatBytes(downloadSizeBytes)})"
+                    isDownloaded -> "Downloaded"
+                    downloadProgress != null -> "Downloading ${downloadProgress.coerceIn(0, 100)}%"
+                    else -> "Download"
+                },
+                enabled = !isDownloaded && downloadProgress == null,
                 onClick = {
                     if (!isDownloaded) {
                         onDownload()
@@ -135,8 +170,11 @@ fun SongOptionsBottomSheet(
             BottomSheetOption(
                 icon = Icons.Default.Person,
                 text = "Go to artist",
+                enabled = song.artistId != null,
                 onClick = {
-                    onGoToArtist()
+                    if (song.artistId != null) {
+                        onGoToArtist()
+                    }
                     onDismiss()
                 }
             )
@@ -162,6 +200,16 @@ fun SongOptionsBottomSheet(
             )
         }
     }
+}
+
+private fun formatBytes(bytes: Long): String {
+    if (bytes < 1024L) return "$bytes B"
+    val kb = bytes / 1024.0
+    if (kb < 1024.0) return String.format("%.1f KB", kb)
+    val mb = kb / 1024.0
+    if (mb < 1024.0) return String.format("%.2f MB", mb)
+    val gb = mb / 1024.0
+    return String.format("%.2f GB", gb)
 }
 
 @Composable

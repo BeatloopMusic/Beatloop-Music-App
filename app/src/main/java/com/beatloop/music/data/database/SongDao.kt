@@ -54,8 +54,48 @@ interface SongDao {
     @Query("UPDATE songs SET downloadState = :state, localPath = :localPath WHERE id = :id")
     suspend fun updateDownloadState(id: String, state: DownloadState, localPath: String?)
     
-    @Query("UPDATE songs SET playCount = playCount + 1, lastPlayedAt = :playedAt WHERE id = :id")
+    @Query(
+        """
+        UPDATE songs
+        SET playCount = playCount + 1,
+            lastPlayedAt = :playedAt,
+            lastUpdatedTimestamp = :playedAt,
+            isSynced = 0
+        WHERE id = :id
+        """
+    )
     suspend fun incrementPlayCount(id: String, playedAt: Long = System.currentTimeMillis())
+
+    @Query("SELECT * FROM songs WHERE playCount > 0 AND isSynced = 0 ORDER BY lastUpdatedTimestamp ASC LIMIT :limit")
+    suspend fun getUnsyncedListeningSongs(limit: Int = 200): List<Song>
+
+    @Query("SELECT MAX(lastUpdatedTimestamp) FROM songs WHERE playCount > 0")
+    suspend fun getLatestListeningUpdatedTimestamp(): Long?
+
+    @Query("UPDATE songs SET isSynced = 1 WHERE id IN (:songIds)")
+    suspend fun markListeningSongsSynced(songIds: List<String>)
+
+    @Query(
+        """
+        UPDATE songs
+        SET title = :title,
+            artistsText = :artistsText,
+            playCount = :playCount,
+            lastPlayedAt = :lastPlayedAt,
+            lastUpdatedTimestamp = :lastUpdatedTimestamp,
+            isSynced = :isSynced
+        WHERE id = :songId
+        """
+    )
+    suspend fun updateListeningAggregate(
+        songId: String,
+        title: String,
+        artistsText: String,
+        playCount: Int,
+        lastPlayedAt: Long?,
+        lastUpdatedTimestamp: Long,
+        isSynced: Boolean
+    )
     
     @Query("SELECT * FROM songs ORDER BY playCount DESC LIMIT :limit")
     fun getMostPlayedSongs(limit: Int = 50): Flow<List<Song>>
@@ -107,6 +147,39 @@ interface SongDao {
     // Playlist methods
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun createPlaylist(playlist: PlaylistEntity): Long
+
+    @Query("SELECT * FROM local_playlists WHERE id = :playlistId LIMIT 1")
+    suspend fun getPlaylistEntityById(playlistId: Long): PlaylistEntity?
+
+    @Query("SELECT * FROM local_playlists WHERE syncId = :syncId LIMIT 1")
+    suspend fun getPlaylistBySyncId(syncId: String): PlaylistEntity?
+
+    @Query(
+        """
+        SELECT lp.id as id,
+               lp.syncId as syncId,
+               lp.name as name,
+               COALESCE(GROUP_CONCAT(lps.songId, ','), '') as songIdsCsv,
+               lp.lastUpdatedTimestamp as lastUpdatedTimestamp,
+               lp.isSynced as isSynced
+        FROM local_playlists lp
+        LEFT JOIN local_playlist_songs lps ON lps.playlistId = lp.id
+        WHERE lp.isSynced = 0
+        GROUP BY lp.id
+        ORDER BY lp.lastUpdatedTimestamp ASC
+        LIMIT :limit
+        """
+    )
+    suspend fun getUnsyncedPlaylists(limit: Int = 100): List<PlaylistSyncSnapshot>
+
+    @Query("SELECT MAX(lastUpdatedTimestamp) FROM local_playlists")
+    suspend fun getLatestPlaylistUpdatedTimestamp(): Long?
+
+    @Query("UPDATE local_playlists SET isSynced = 1 WHERE syncId IN (:syncIds)")
+    suspend fun markPlaylistsSynced(syncIds: List<String>)
+
+    @Query("UPDATE local_playlists SET lastUpdatedTimestamp = :updatedAt, isSynced = 0 WHERE id = :playlistId")
+    suspend fun markPlaylistDirty(playlistId: Long, updatedAt: Long = System.currentTimeMillis())
     
     @Query("SELECT id, name, (SELECT COUNT(*) FROM local_playlist_songs WHERE playlistId = local_playlists.id) as songCount FROM local_playlists ORDER BY createdAt DESC")
     fun getLocalPlaylists(): Flow<List<LocalPlaylist>>
@@ -114,22 +187,45 @@ interface SongDao {
     @Query("DELETE FROM local_playlists WHERE id = :playlistId")
     suspend fun deletePlaylist(playlistId: Long)
     
-    @Query("UPDATE local_playlists SET name = :name WHERE id = :playlistId")
-    suspend fun updatePlaylistName(playlistId: Long, name: String)
+    @Query("UPDATE local_playlists SET name = :name, lastUpdatedTimestamp = :updatedAt, isSynced = 0 WHERE id = :playlistId")
+    suspend fun updatePlaylistName(
+        playlistId: Long,
+        name: String,
+        updatedAt: Long = System.currentTimeMillis()
+    )
+
+    @Query("UPDATE local_playlists SET name = :name, lastUpdatedTimestamp = :updatedAt, isSynced = 1 WHERE id = :playlistId")
+    suspend fun applyRemotePlaylistUpdate(
+        playlistId: Long,
+        name: String,
+        updatedAt: Long
+    )
     
     @Transaction
     @Query("SELECT * FROM local_playlists WHERE id = :playlistId")
     fun getPlaylistWithSongs(playlistId: Long): Flow<LocalPlaylistWithSongs?>
     
     @Insert(onConflict = OnConflictStrategy.IGNORE)
-    suspend fun addSongToPlaylistEntry(entry: PlaylistSongCrossRef)
-    
-    suspend fun addSongToPlaylist(playlistId: Long, songId: String) {
-        addSongToPlaylistEntry(PlaylistSongCrossRef(playlistId, songId))
+    suspend fun addSongToPlaylistEntry(entry: PlaylistSongCrossRef): Long
+
+    suspend fun addSongToPlaylist(playlistId: Long, songId: String): Boolean {
+        val inserted = addSongToPlaylistEntry(PlaylistSongCrossRef(playlistId, songId)) != -1L
+        if (inserted) {
+            markPlaylistDirty(playlistId)
+        }
+        return inserted
     }
-    
+
     @Query("DELETE FROM local_playlist_songs WHERE playlistId = :playlistId AND songId = :songId")
-    suspend fun removeSongFromPlaylist(playlistId: Long, songId: String)
+    suspend fun removeSongFromPlaylistEntry(playlistId: Long, songId: String)
+
+    @Query("DELETE FROM local_playlist_songs WHERE playlistId = :playlistId")
+    suspend fun clearPlaylistSongs(playlistId: Long)
+
+    suspend fun removeSongFromPlaylist(playlistId: Long, songId: String) {
+        removeSongFromPlaylistEntry(playlistId, songId)
+        markPlaylistDirty(playlistId)
+    }
     
     // Downloads - returns as SongItem
     @Query("""

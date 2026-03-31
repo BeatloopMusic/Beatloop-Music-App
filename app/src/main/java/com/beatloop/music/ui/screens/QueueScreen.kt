@@ -4,6 +4,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.QueueMusic
 import androidx.compose.material3.*
@@ -24,7 +25,8 @@ fun QueueScreen(
     viewModel: PlayerViewModel = hiltViewModel()
 ) {
     val queue by viewModel.queue.collectAsState()
-    
+    val isLocked by viewModel.isQueueLocked.collectAsState()
+
     Scaffold(
         topBar = {
             TopAppBar(
@@ -32,6 +34,15 @@ fun QueueScreen(
                 navigationIcon = {
                     IconButton(onClick = onNavigateBack) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                    }
+                },
+                actions = {
+                    IconButton(onClick = { viewModel.toggleQueueLock() }) {
+                        Icon(
+                            imageVector = if (isLocked) Icons.Default.Lock else Icons.Default.Lock,
+                            contentDescription = "Lock Queue",
+                            tint = if (isLocked) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface
+                        )
                     }
                 }
             )

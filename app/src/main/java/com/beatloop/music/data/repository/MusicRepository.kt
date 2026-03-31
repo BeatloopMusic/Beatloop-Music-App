@@ -5,11 +5,18 @@ import com.beatloop.music.data.api.InnerTubeApi
 import com.beatloop.music.data.api.ReturnYouTubeDislikeApi
 import com.beatloop.music.data.database.ArtistPlayStat
 import com.beatloop.music.data.database.DownloadedSongDao
+import com.beatloop.music.data.database.DownloadedSong
+import com.beatloop.music.data.database.DeletedPlaylistSyncEntity
+import com.beatloop.music.data.database.InteractionSignalTypes
+import com.beatloop.music.data.database.ListeningSessionEvent
 import com.beatloop.music.data.database.SongDao
 import com.beatloop.music.data.database.SearchHistoryDao
 import com.beatloop.music.data.database.SearchHistory
+import com.beatloop.music.data.database.SyncDao
 import com.beatloop.music.data.model.*
 import com.beatloop.music.data.preferences.PreferencesManager
+import com.beatloop.music.domain.recommendation.RecommendationCandidate
+import com.beatloop.music.domain.recommendation.RecommendationSource
 import com.google.gson.Gson
 import com.google.gson.JsonArray
 import com.google.gson.JsonObject
@@ -21,6 +28,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
@@ -49,7 +57,9 @@ class MusicRepository @Inject constructor(
     private val songDao: SongDao,
     private val searchHistoryDao: SearchHistoryDao,
     private val downloadedSongDao: DownloadedSongDao,
-    private val preferencesManager: PreferencesManager
+    private val syncDao: SyncDao,
+    private val preferencesManager: PreferencesManager,
+    private val recommendationRepository: RecommendationRepository
 ) {
     private data class OnboardingSeedCache(
         val key: String,
@@ -101,6 +111,11 @@ class MusicRepository @Inject constructor(
         val playerScriptUrl: String,
         val operations: List<SignatureOperation>
     )
+
+    private enum class StreamMode {
+        AUDIO,
+        VIDEO
+    }
 
     @Volatile
     private var signatureDecipherPlanCache: SignatureDecipherPlan? = null
@@ -269,7 +284,9 @@ class MusicRepository @Inject constructor(
             Log.d(TAG, "Search parsed: ${result.songs.size} songs, ${result.artists.size} artists, ${result.albums.size} albums")
             
             // Save to search history
-            searchHistoryDao.insert(SearchHistory(query))
+            searchHistoryDao.upsertQuery(query)
+            runCatching { recommendationRepository.recordSearchQuery(query) }
+                .onFailure { error -> Log.w(TAG, "Failed to track search signal", error) }
             
             Result.success(result)
         } catch (e: Exception) {
@@ -344,10 +361,6 @@ class MusicRepository @Inject constructor(
             val topArtistStats = songDao.getTopArtistPlayStats(limit = 30)
             val preferenceProfile = getPreferenceProfile()
             val onboardingSeedSongs = getOnboardingSeedSongs(preferenceProfile)
-            val onboardingSeedSongIds = onboardingSeedSongs.map { it.id }.toSet()
-            val languageTokens = preferenceProfile.languages.flatMap { language ->
-                languageSearchHints[language.lowercase()] ?: listOf(language)
-            }.map { it.lowercase() }
 
             val topArtists = buildTopArtists(seedSongs, topArtistStats)
             val weightedArtists: List<String> = (topArtists + preferenceProfile.singers)
@@ -357,52 +370,52 @@ class MusicRepository @Inject constructor(
                 .mapIndexed { index, artist -> artist to (40 - index * 6).coerceAtLeast(8) }
                 .toMap()
 
-            val seedById = seedSongs.associateBy { it.id }
-            val candidateSongs = (
-                base.quickPicks +
-                    base.trendingSongs +
-                    recentSongs +
-                    seedSongs.map { it.toSongItem() } +
-                    onboardingSeedSongs
+            val recommendationCandidates = (
+                base.quickPicks.map {
+                    RecommendationCandidate(
+                        song = it,
+                        source = RecommendationSource.QUICK_PICK,
+                        sourceBoost = 12.0
+                    )
+                } +
+                    base.trendingSongs.map {
+                        RecommendationCandidate(
+                            song = it,
+                            source = RecommendationSource.TRENDING,
+                            sourceBoost = 7.0
+                        )
+                    } +
+                    recentSongs.map {
+                        RecommendationCandidate(
+                            song = it,
+                            source = RecommendationSource.RECENT,
+                            sourceBoost = 3.0
+                        )
+                    } +
+                    seedSongs.map {
+                        RecommendationCandidate(
+                            song = it.toSongItem(),
+                            source = RecommendationSource.PERSONALIZATION_SEED,
+                            sourceBoost = 8.0
+                        )
+                    } +
+                    onboardingSeedSongs.map {
+                        RecommendationCandidate(
+                            song = it,
+                            source = RecommendationSource.ONBOARDING,
+                            sourceBoost = 10.0
+                        )
+                    }
                 )
-                .distinctBy { it.id }
+                .distinctBy { it.song.id }
 
-            val personalized = candidateSongs
-                .sortedByDescending { candidate ->
-                    val seed = seedById[candidate.id]
-                    val candidateText = "${candidate.title} ${candidate.artistsText}".lowercase()
-                    val artistScore = splitArtists(candidate.artistsText)
-                        .maxOfOrNull { artist -> topArtistWeight[artist] ?: 0 }
-                        ?: 0
-                    val playScore = (seed?.playCount ?: 0) * 4
-                    val likeScore = if (seed?.liked == true) 20 else 0
-                    val recentScore = if (seed?.lastPlayedAt != null) {
-                        val ageHours = ((System.currentTimeMillis() - seed.lastPlayedAt) / (1000 * 60 * 60)).coerceAtLeast(0)
-                        (24 - ageHours.toInt()).coerceAtLeast(0)
-                    } else {
-                        0
-                    }
-                    val singerPreferenceScore = preferenceProfile.singers.fold(0) { acc, singer ->
-                        acc + if (candidate.artistsText.contains(singer, ignoreCase = true)) 24 else 0
-                    }
-                    val creatorHintText = "${candidate.title} ${candidate.artistsText}"
-                    val lyricistPreferenceScore = preferenceProfile.lyricists.fold(0) { acc, lyricist ->
-                        acc + if (creatorHintText.contains(lyricist, ignoreCase = true)) 14 else 0
-                    }
-                    val directorPreferenceScore = preferenceProfile.musicDirectors.fold(0) { acc, director ->
-                        acc + if (creatorHintText.contains(director, ignoreCase = true)) 14 else 0
-                    }
-                    val languagePreferenceScore = languageTokens.fold(0) { acc, token ->
-                        acc + if (candidateText.contains(token)) 10 else 0
-                    }
-                    val onboardingSeedBoost = if (onboardingSeedSongIds.contains(candidate.id)) 30 else 0
-                    val baseFeedBoost = if (base.quickPicks.any { it.id == candidate.id }) 8 else 0
-                    val personalizationScore = artistScore + playScore + likeScore + recentScore + singerPreferenceScore +
-                        lyricistPreferenceScore + directorPreferenceScore + languagePreferenceScore +
-                        onboardingSeedBoost + baseFeedBoost
-                    personalizationScore
-                }
-                .take(30)
+            val personalized = recommendationRepository
+                .rankHomeCandidates(
+                    candidates = recommendationCandidates,
+                    topArtistWeights = topArtistWeight,
+                    refreshNonce = refreshNonce,
+                    limit = 30
+                )
 
             val motivationMessage = when {
                 onboardingSeedSongs.isNotEmpty() && preferenceProfile.singers.isNotEmpty() ->
@@ -429,10 +442,29 @@ class MusicRepository @Inject constructor(
                 .distinctBy { it.id }
                 .take(15)
 
+            val finalQuickPicks = diversifiedPool.take(15)
+                .ifEmpty { fallbackQuickPicks.ifEmpty { base.quickPicks } }
+
+            val finalQuickPickIds = finalQuickPicks.map { it.id }.toSet()
+
+            val finalPersonalized = diversifiedPool
+                .filterNot { finalQuickPickIds.contains(it.id) }
+                .ifEmpty {
+                    personalizedPool.filterNot { finalQuickPickIds.contains(it.id) }
+                }
+                .ifEmpty { diversifiedPool }
+
+            runCatching {
+                recommendationRepository.recordRecommendationImpressions(
+                    songs = (finalQuickPicks + finalPersonalized).distinctBy { it.id },
+                    surface = "home"
+                )
+            }
+
             base.copy(
                 motivationMessage = motivationMessage,
-                quickPicks = diversifiedPool.take(15).ifEmpty { fallbackQuickPicks.ifEmpty { base.quickPicks } },
-                personalizedRecommendations = diversifiedPool.ifEmpty { personalizedPool },
+                quickPicks = finalQuickPicks,
+                personalizedRecommendations = finalPersonalized,
                 recentlyPlayed = recentSongs.ifEmpty { base.recentlyPlayed },
                 topArtists = weightedArtists.take(5).ifEmpty { preferenceProfile.singers.take(5) }
             )
@@ -604,6 +636,7 @@ class MusicRepository @Inject constructor(
             id = id,
             title = title,
             artistsText = artistsText,
+            artistId = artistId,
             thumbnailUrl = thumbnailUrl,
             albumId = albumId,
             duration = duration,
@@ -661,7 +694,19 @@ class MusicRepository @Inject constructor(
         }
     }
     
-    suspend fun getStreamUrl(videoId: String): Result<String> = withContext(Dispatchers.IO) {
+    suspend fun getStreamUrl(videoId: String): Result<String> {
+        return getStreamUrlInternal(videoId, mode = StreamMode.AUDIO, targetVideoHeight = 360)
+    }
+
+    suspend fun getVideoStreamUrl(videoId: String, targetVideoHeight: Int = 360): Result<String> {
+        return getStreamUrlInternal(videoId, mode = StreamMode.VIDEO, targetVideoHeight = targetVideoHeight)
+    }
+
+    private suspend fun getStreamUrlInternal(
+        videoId: String,
+        mode: StreamMode,
+        targetVideoHeight: Int
+    ): Result<String> = withContext(Dispatchers.IO) {
         Log.d(TAG, "===== STREAM RESOLUTION START for $videoId =====")
 
         suspend fun attempt(
@@ -689,70 +734,72 @@ class MusicRepository @Inject constructor(
         }
 
         val newPipeUrl = attempt("NewPipe extractor fallback", timeoutMs = STRATEGY_TIMEOUT_SLOW_MS) {
-            tryGetStreamUrlFromNewPipe(videoId)
+            tryGetStreamUrlFromNewPipe(videoId, mode = mode, targetVideoHeight = targetVideoHeight)
         }
         if (newPipeUrl != null) {
             return@withContext Result.success(newPipeUrl)
         }
 
         val iosUrl = attempt("iOS Innertube") {
-            tryGetStreamUrl(videoId, createiOSContext())
+            tryGetStreamUrl(videoId, createiOSContext(), mode = mode, targetVideoHeight = targetVideoHeight)
         }
         if (iosUrl != null) {
             return@withContext Result.success(iosUrl)
         }
 
         val androidUrl = attempt("Android Innertube") {
-            tryGetStreamUrl(videoId, createAndroidContext())
+            tryGetStreamUrl(videoId, createAndroidContext(), mode = mode, targetVideoHeight = targetVideoHeight)
         }
         if (androidUrl != null) {
             return@withContext Result.success(androidUrl)
         }
 
         val tvUrl = attempt("TV Innertube", timeoutMs = STRATEGY_TIMEOUT_SLOW_MS) {
-            tryGetStreamUrlTV(videoId)
+            tryGetStreamUrlTV(videoId, mode = mode, targetVideoHeight = targetVideoHeight)
         }
         if (tvUrl != null) {
             return@withContext Result.success(tvUrl)
         }
 
         val webUrl = attempt("Web Innertube") {
-            tryGetStreamUrl(videoId, createWebContext())
+            tryGetStreamUrl(videoId, createWebContext(), mode = mode, targetVideoHeight = targetVideoHeight)
         }
         if (webUrl != null) {
             return@withContext Result.success(webUrl)
         }
 
         val outerTuneFallbackUrl = attempt("OuterTune-style client fallback") {
-            tryGetStreamUrlFromOuterTuneClientFallbacks(videoId)
+            tryGetStreamUrlFromOuterTuneClientFallbacks(videoId, mode = mode, targetVideoHeight = targetVideoHeight)
         }
         if (outerTuneFallbackUrl != null) {
             return@withContext Result.success(outerTuneFallbackUrl)
         }
 
         val watchUrl = attempt("Watch-page extraction", timeoutMs = STRATEGY_TIMEOUT_SLOW_MS) {
-            tryGetStreamUrlFromWatchPage(videoId)
+            tryGetStreamUrlFromWatchPage(videoId, mode = mode, targetVideoHeight = targetVideoHeight)
         }
         if (watchUrl != null) {
             return@withContext Result.success(watchUrl)
         }
 
-        val invidiousUrl = attempt("Invidious fallback", timeoutMs = STRATEGY_TIMEOUT_SLOW_MS) {
-            tryGetStreamUrlFromInvidious(videoId)
-        }
-        if (invidiousUrl != null) {
-            return@withContext Result.success(invidiousUrl)
-        }
+        if (mode == StreamMode.AUDIO) {
+            val invidiousUrl = attempt("Invidious fallback", timeoutMs = STRATEGY_TIMEOUT_SLOW_MS) {
+                tryGetStreamUrlFromInvidious(videoId)
+            }
+            if (invidiousUrl != null) {
+                return@withContext Result.success(invidiousUrl)
+            }
 
-        val pipedUrl = attempt("Piped fallback", timeoutMs = STRATEGY_TIMEOUT_SLOW_MS) {
-            tryGetStreamUrlFromPiped(videoId)
-        }
-        if (pipedUrl != null) {
-            return@withContext Result.success(pipedUrl)
+            val pipedUrl = attempt("Piped fallback", timeoutMs = STRATEGY_TIMEOUT_SLOW_MS) {
+                tryGetStreamUrlFromPiped(videoId)
+            }
+            if (pipedUrl != null) {
+                return@withContext Result.success(pipedUrl)
+            }
         }
 
         val videoInfoUrl = attempt("get_video_info fallback") {
-            tryGetStreamUrlFromVideoInfo(videoId)
+            tryGetStreamUrlFromVideoInfo(videoId, mode = mode, targetVideoHeight = targetVideoHeight)
         }
         if (videoInfoUrl != null) {
             return@withContext Result.success(videoInfoUrl)
@@ -762,7 +809,11 @@ class MusicRepository @Inject constructor(
         Result.failure(Exception("Unable to obtain stream URL from any source"))
     }
     
-    private suspend fun tryGetStreamUrlTV(videoId: String): String? {
+    private suspend fun tryGetStreamUrlTV(
+        videoId: String,
+        mode: StreamMode = StreamMode.AUDIO,
+        targetVideoHeight: Int = 360
+    ): String? {
         return try {
             println("  >>> Attempting TV player...")
             val context = createTVContext().deepCopy().apply {
@@ -798,7 +849,7 @@ class MusicRepository @Inject constructor(
                 return null
             }
             
-            val url = parseStreamUrl(response)
+            val url = parseStreamUrl(response, mode = mode, targetVideoHeight = targetVideoHeight)
             println("      Got URL: ${if (url == null) "NULL" else url.take(60) + "..."}")
             url
         } catch (e: Exception) {
@@ -959,7 +1010,12 @@ class MusicRepository @Inject constructor(
         return null
     }
     
-    private suspend fun tryGetStreamUrl(videoId: String, context: JsonObject): String? {
+    private suspend fun tryGetStreamUrl(
+        videoId: String,
+        context: JsonObject,
+        mode: StreamMode = StreamMode.AUDIO,
+        targetVideoHeight: Int = 360
+    ): String? {
         val clientName = context.getAsJsonObject("client")?.get("clientName")?.asString ?: "UNKNOWN"
         return try {
             Log.d(TAG, "Attempting $clientName player...")
@@ -1005,7 +1061,7 @@ class MusicRepository @Inject constructor(
                 return null
             }
             
-            val url = parseStreamUrl(response)
+            val url = parseStreamUrl(response, mode = mode, targetVideoHeight = targetVideoHeight)
             Log.d(TAG, "$clientName parseStreamUrl returned: ${if (url == null) "NULL" else url.take(100)}")
             url
         } catch (e: Exception) {
@@ -1014,7 +1070,11 @@ class MusicRepository @Inject constructor(
         }
     }
 
-    private suspend fun tryGetStreamUrlFromOuterTuneClientFallbacks(videoId: String): String? {
+    private suspend fun tryGetStreamUrlFromOuterTuneClientFallbacks(
+        videoId: String,
+        mode: StreamMode = StreamMode.AUDIO,
+        targetVideoHeight: Int = 360
+    ): String? {
         val contexts = listOf(
             "ANDROID_VR" to createAndroidVrContext(),
             "ANDROID" to createAndroidClientContext(),
@@ -1025,7 +1085,7 @@ class MusicRepository @Inject constructor(
         var firstCandidate: String? = null
 
         for ((label, context) in contexts) {
-            val url = tryGetStreamUrl(videoId, context) ?: continue
+            val url = tryGetStreamUrl(videoId, context, mode = mode, targetVideoHeight = targetVideoHeight) ?: continue
             if (firstCandidate == null) {
                 firstCandidate = url
             }
@@ -1059,7 +1119,11 @@ class MusicRepository @Inject constructor(
         }
     }
 
-    private suspend fun tryGetStreamUrlFromVideoInfo(videoId: String): String? {
+    private suspend fun tryGetStreamUrlFromVideoInfo(
+        videoId: String,
+        mode: StreamMode = StreamMode.AUDIO,
+        targetVideoHeight: Int = 360
+    ): String? {
         return try {
             println("  >>> Attempting get_video_info fallback...")
             val client = okhttp3.OkHttpClient.Builder()
@@ -1101,7 +1165,7 @@ class MusicRepository @Inject constructor(
 
                 val playerResponseRaw = pairs["player_response"] ?: return null
                 val playerResponse = Gson().fromJson(playerResponseRaw, JsonObject::class.java) ?: return null
-                parseStreamUrl(playerResponse)
+                parseStreamUrl(playerResponse, mode = mode, targetVideoHeight = targetVideoHeight)
             }
         } catch (e: Exception) {
             Log.w(TAG, "tryGetStreamUrlFromVideoInfo failed: ${e.message}")
@@ -1109,7 +1173,11 @@ class MusicRepository @Inject constructor(
         }
     }
 
-    private suspend fun tryGetStreamUrlFromWatchPage(videoId: String): String? {
+    private suspend fun tryGetStreamUrlFromWatchPage(
+        videoId: String,
+        mode: StreamMode = StreamMode.AUDIO,
+        targetVideoHeight: Int = 360
+    ): String? {
         println("  >>> Attempting watch-page HTML parsing...")
         val client = okhttp3.OkHttpClient.Builder()
             .connectTimeout(10, TimeUnit.SECONDS)
@@ -1155,7 +1223,7 @@ class MusicRepository @Inject constructor(
                         return@use
                     }
                     
-                    val streamUrl = parseStreamUrl(playerResponse)
+                    val streamUrl = parseStreamUrl(playerResponse, mode = mode, targetVideoHeight = targetVideoHeight)
                     println("        parseStreamUrl returned: ${if (streamUrl == null) "NULL" else streamUrl.take(60) + "..."}")
                     
                     if (isUsableStreamUrl(streamUrl)) {
@@ -1173,11 +1241,20 @@ class MusicRepository @Inject constructor(
         return null
     }
 
-    private suspend fun tryGetStreamUrlFromNewPipe(videoId: String): String? {
+    private suspend fun tryGetStreamUrlFromNewPipe(
+        videoId: String,
+        mode: StreamMode = StreamMode.AUDIO,
+        targetVideoHeight: Int = 360
+    ): String? {
         return try {
             ensureNewPipeInitialized()
             val watchUrl = "https://www.youtube.com/watch?v=$videoId"
             val streamInfo = StreamInfo.getInfo(ServiceList.YouTube, watchUrl)
+
+            if (mode == StreamMode.VIDEO && isUsableStreamUrl(streamInfo.hlsUrl)) {
+                Log.d(TAG, "Using NewPipe HLS manifest for video mode target=${targetVideoHeight}p")
+                return streamInfo.hlsUrl
+            }
 
             val bestAudioStream = selectBestAudioStream(streamInfo.audioStreams)
             val bestAudioUrl = bestAudioStream?.url
@@ -2413,7 +2490,11 @@ class MusicRepository @Inject constructor(
         )
     }
     
-    private fun parseStreamUrl(response: JsonObject): String? {
+    private fun parseStreamUrl(
+        response: JsonObject,
+        mode: StreamMode = StreamMode.AUDIO,
+        targetVideoHeight: Int = 360
+    ): String? {
         return try {
             val streamingData = response.getAsJsonObject("streamingData")
             if (streamingData == null) {
@@ -2455,10 +2536,38 @@ class MusicRepository @Inject constructor(
 
             var bestAudioUrl: String? = null
             var highestBitrate = 0
+            var bestVideoUrl: String? = null
+            var bestVideoDistance = Int.MAX_VALUE
+            var bestVideoHeight = 0
             
             formatCandidates.forEach { formatObj ->
                 val mimeType = formatObj.get("mimeType")?.asString ?: return@forEach
                 
+                if (mode == StreamMode.VIDEO && mimeType.contains("video")) {
+                    val height = formatObj.get("height")?.asInt ?: 0
+                    val isMp4Video = mimeType.contains("video/mp4", ignoreCase = true)
+                    var url = formatObj.get("url")?.asString
+
+                    if (url == null) {
+                        val signatureCipher = formatObj.get("signatureCipher")?.asString
+                            ?: formatObj.get("cipher")?.asString
+                        if (signatureCipher != null) {
+                            url = parseSignatureCipher(signatureCipher)
+                        }
+                    }
+
+                    if (isUsableStreamUrl(url)) {
+                        val distance = kotlin.math.abs(height - targetVideoHeight)
+                        // Prefer MP4 direct streams first when available for better device compatibility.
+                        val scoreBoost = if (isMp4Video) -1 else 0
+                        if ((distance + scoreBoost) < bestVideoDistance || ((distance + scoreBoost) == bestVideoDistance && height > bestVideoHeight)) {
+                            bestVideoDistance = distance
+                            bestVideoHeight = height
+                            bestVideoUrl = url
+                        }
+                    }
+                }
+
                 if (mimeType.contains("audio")) {
                     val bitrate = formatObj.get("averageBitrate")?.asInt
                         ?: formatObj.get("bitrate")?.asInt ?: 0
@@ -2479,6 +2588,27 @@ class MusicRepository @Inject constructor(
                         Log.d(TAG, "Found audio format: $mimeType, bitrate: $bitrate")
                     }
                 }
+            }
+
+            if (mode == StreamMode.VIDEO) {
+                if (isUsableStreamUrl(bestVideoUrl)) {
+                    Log.d(TAG, "Selected video format around ${targetVideoHeight}p (actual=${bestVideoHeight}p)")
+                    return bestVideoUrl
+                }
+
+                // Fallback to adaptive manifests only if no direct video URL was selected.
+                if (isUsableStreamUrl(hlsManifestUrl)) {
+                    Log.d(TAG, "Using HLS manifest fallback for video mode")
+                    return hlsManifestUrl
+                }
+
+                if (isUsableStreamUrl(dashManifestUrl)) {
+                    Log.d(TAG, "Using DASH manifest fallback for video mode")
+                    return dashManifestUrl
+                }
+
+                Log.w(TAG, "No playable video URL found in formats")
+                return null
             }
             
             if (bestAudioUrl == null) {
@@ -2819,7 +2949,19 @@ class MusicRepository @Inject constructor(
         )
     }
     
-    suspend fun deleteLocalPlaylist(playlistId: Long) = songDao.deletePlaylist(playlistId)
+    suspend fun deleteLocalPlaylist(playlistId: Long) {
+        val playlist = songDao.getPlaylistEntityById(playlistId)
+        if (playlist != null) {
+            syncDao.upsertDeletedPlaylist(
+                DeletedPlaylistSyncEntity(
+                    syncId = playlist.syncId,
+                    deletedAt = System.currentTimeMillis(),
+                    isSynced = false
+                )
+            )
+        }
+        songDao.deletePlaylist(playlistId)
+    }
     
     suspend fun renameLocalPlaylist(playlistId: Long, name: String) = 
         songDao.updatePlaylistName(playlistId, name)
@@ -2827,13 +2969,31 @@ class MusicRepository @Inject constructor(
     fun getLocalPlaylistWithSongs(playlistId: Long): Flow<LocalPlaylistWithSongs?> = 
         songDao.getPlaylistWithSongs(playlistId)
     
-    suspend fun addSongToPlaylist(playlistId: Long, songId: String) {
-        songDao.addSongToPlaylist(playlistId, songId)
+suspend fun addSongToPlaylist(playlistId: Long, songId: String): Boolean {
+        val added = songDao.addSongToPlaylist(playlistId, songId)
+        if (added) {
+            runCatching {
+                recommendationRepository.recordSongInteraction(
+                    songId = songId,
+                    signalType = InteractionSignalTypes.PLAYLIST_ADD
+                )
+            }
+        }
+        return added
     }
-    
-    suspend fun addSongToPlaylist(playlistId: Long, song: SongItem) {
+
+    suspend fun addSongToPlaylist(playlistId: Long, song: SongItem): Boolean {
         saveSong(song)
-        songDao.addSongToPlaylist(playlistId, song.id)
+        val added = songDao.addSongToPlaylist(playlistId, song.id)
+        if (added) {
+            runCatching {
+                recommendationRepository.recordSongInteraction(
+                    songId = song.id,
+                    signalType = InteractionSignalTypes.PLAYLIST_ADD
+                )
+            }
+        }
+        return added
     }
     
     suspend fun removeSongFromPlaylist(playlistId: Long, songId: String) {
@@ -2849,6 +3009,7 @@ class MusicRepository @Inject constructor(
                     id = song.id,
                     title = song.title,
                     artistsText = song.artistsText,
+                    artistId = song.artistId,
                     albumId = song.albumId,
                     thumbnailUrl = song.thumbnailUrl,
                     duration = song.duration ?: 0L
@@ -2861,6 +3022,11 @@ class MusicRepository @Inject constructor(
     fun getDownloadedSongs(): Flow<List<SongItem>> = songDao.getDownloadedSongs()
 
     suspend fun getDownloadedSong(songId: String) = downloadedSongDao.getDownload(songId)
+
+    fun getDownloadedSongSizeMap(): Flow<Map<String, Long>> =
+        downloadedSongDao.getAllDownloads().map { downloads: List<DownloadedSong> ->
+            downloads.associate { it.id to it.fileSize }
+        }
 
     suspend fun setSongDownloadState(songId: String, state: DownloadState, localPath: String? = null) {
         songDao.updateDownloadState(songId, state, localPath)
@@ -2918,18 +3084,119 @@ class MusicRepository @Inject constructor(
     }
     
     suspend fun clearPlayHistory() = songDao.clearPlayHistory()
+
+    suspend fun recordListeningSession(
+        songId: String,
+        playedAt: Long,
+        listenedMs: Long,
+        trackDurationMs: Long?,
+        previousSongId: String? = null,
+        nextSongId: String? = null,
+        source: String = "player"
+    ) {
+        if (songId.isBlank()) return
+
+        val safeListenedMs = listenedMs.coerceAtLeast(0L)
+        val safeDuration = trackDurationMs?.takeIf { it > 0L }
+        val completionRate = when {
+            safeDuration != null -> (safeListenedMs.toDouble() / safeDuration.toDouble()).coerceIn(0.0, 1.25).toFloat()
+            safeListenedMs >= 180_000L -> 1f
+            safeListenedMs > 0L -> 0.4f
+            else -> 0f
+        }
+
+        val wasCompleted = when {
+            safeDuration != null -> completionRate >= 0.92f
+            else -> safeListenedMs >= 180_000L
+        }
+        val wasSkipped = when {
+            safeDuration != null -> completionRate in 0.01f..0.35f
+            else -> safeListenedMs in 1L..20_000L
+        }
+
+        recommendationRepository.recordListeningEvent(
+            ListeningSessionEvent(
+                songId = songId,
+                previousSongId = previousSongId,
+                nextSongId = nextSongId,
+                playedAt = playedAt,
+                listenedMs = safeListenedMs,
+                trackDurationMs = safeDuration,
+                completionRate = completionRate.coerceIn(0f, 1f),
+                wasSkipped = wasSkipped,
+                wasCompleted = wasCompleted,
+                source = source
+            )
+        )
+    }
+
+    suspend fun predictNextSongs(
+        seedSongId: String?,
+        candidates: List<SongItem>,
+        queueSongIds: Set<String>,
+        limit: Int = 20
+    ): List<SongItem> {
+        if (candidates.isEmpty()) return emptyList()
+
+        val recommendationCandidates = candidates
+            .filter { it.id.isNotBlank() }
+            .distinctBy { it.id }
+            .map { song ->
+                RecommendationCandidate(
+                    song = song,
+                    source = RecommendationSource.RELATED,
+                    sourceBoost = 6.0
+                )
+            }
+
+        return recommendationRepository.rankNextSongCandidates(
+            seedSongId = seedSongId,
+            candidates = recommendationCandidates,
+            queueSongIds = queueSongIds,
+            limit = limit
+        )
+    }
+
+    suspend fun recordRecommendationImpressions(
+        songs: List<SongItem>,
+        surface: String
+    ) {
+        recommendationRepository.recordRecommendationImpressions(songs, surface)
+    }
     
     // Liked songs
     fun getLikedSongs(): Flow<List<SongItem>> = songDao.getLikedSongs()
     
-    suspend fun likeSong(songId: String) = songDao.likeSong(songId)
+    suspend fun likeSong(songId: String) {
+        songDao.likeSong(songId)
+        runCatching {
+            recommendationRepository.recordSongInteraction(
+                songId = songId,
+                signalType = InteractionSignalTypes.LIKE
+            )
+        }
+    }
     
     suspend fun likeSong(song: SongItem) {
         saveSong(song)
         songDao.likeSong(song.id)
+        runCatching {
+            recommendationRepository.recordSongInteraction(
+                songId = song.id,
+                signalType = InteractionSignalTypes.LIKE
+            )
+        }
     }
     
-    suspend fun unlikeSong(songId: String) = songDao.unlikeSong(songId)
+    suspend fun unlikeSong(songId: String) {
+        songDao.unlikeSong(songId)
+        runCatching {
+            recommendationRepository.recordSongInteraction(
+                songId = songId,
+                signalType = InteractionSignalTypes.UNLIKE
+            )
+        }
+    }
     
     suspend fun isSongLiked(songId: String): Boolean = songDao.isSongLiked(songId)
 }

@@ -9,7 +9,11 @@ import com.beatloop.music.data.model.PlaylistItem
 import com.beatloop.music.data.model.SearchFilter
 import com.beatloop.music.data.model.SongItem
 import com.beatloop.music.data.model.VideoItem
-import com.beatloop.music.data.repository.MusicRepository
+import com.beatloop.music.domain.usecase.search.ClearSearchHistoryUseCase
+import com.beatloop.music.domain.usecase.search.DeleteSearchHistoryUseCase
+import com.beatloop.music.domain.usecase.search.GetSearchHistoryUseCase
+import com.beatloop.music.domain.usecase.search.GetSearchSuggestionsUseCase
+import com.beatloop.music.domain.usecase.search.SearchContentUseCase
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -35,13 +39,17 @@ data class SearchUiState(
 
 @HiltViewModel
 class SearchViewModel @Inject constructor(
-    private val musicRepository: MusicRepository
+    private val searchContentUseCase: SearchContentUseCase,
+    private val getSearchSuggestionsUseCase: GetSearchSuggestionsUseCase,
+    private val getSearchHistoryUseCase: GetSearchHistoryUseCase,
+    private val deleteSearchHistoryUseCase: DeleteSearchHistoryUseCase,
+    private val clearSearchHistoryUseCase: ClearSearchHistoryUseCase
 ) : ViewModel() {
     
     private val _uiState = MutableStateFlow(SearchUiState())
     val uiState: StateFlow<SearchUiState> = _uiState.asStateFlow()
     
-    val searchHistory: StateFlow<List<SearchHistory>> = musicRepository.getSearchHistory()
+    val searchHistory: StateFlow<List<SearchHistory>> = getSearchHistoryUseCase()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
     
     fun search(query: String, filter: SearchFilter = SearchFilter.All) {
@@ -50,7 +58,7 @@ class SearchViewModel @Inject constructor(
         viewModelScope.launch {
             _uiState.update { it.copy(isLoading = true, error = null, query = query) }
             
-            musicRepository.search(query, filter)
+            searchContentUseCase(query, filter)
                 .onSuccess { result ->
                     _uiState.update {
                         it.copy(
@@ -79,7 +87,7 @@ class SearchViewModel @Inject constructor(
     
     fun getSearchSuggestions(query: String) {
         viewModelScope.launch {
-            musicRepository.getSearchSuggestions(query)
+            getSearchSuggestionsUseCase(query)
                 .onSuccess { suggestions ->
                     _uiState.update { it.copy(suggestions = suggestions) }
                 }
@@ -88,13 +96,13 @@ class SearchViewModel @Inject constructor(
     
     fun clearSearchHistory() {
         viewModelScope.launch {
-            musicRepository.clearSearchHistory()
+            clearSearchHistoryUseCase()
         }
     }
     
     fun deleteSearchHistory(query: String) {
         viewModelScope.launch {
-            musicRepository.deleteSearchHistory(query)
+            deleteSearchHistoryUseCase(query)
         }
     }
     

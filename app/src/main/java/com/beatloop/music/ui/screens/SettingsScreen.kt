@@ -1,5 +1,8 @@
 package com.beatloop.music.ui.screens
 
+import android.app.Activity
+import android.content.Context
+import android.content.ContextWrapper
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -10,6 +13,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
@@ -25,6 +29,13 @@ fun SettingsScreen(
     viewModel: SettingsViewModel = hiltViewModel()
 ) {
     val uiState by viewModel.uiState.collectAsState()
+    val context = LocalContext.current
+    val activity = remember(context) { context.findActivity() }
+    var showDeleteDataDialog by remember { mutableStateOf(false) }
+
+    LaunchedEffect(Unit) {
+        viewModel.refreshIdentityState()
+    }
     
     Scaffold(
         topBar = {
@@ -47,6 +58,72 @@ fun SettingsScreen(
             // Appearance Section
             item {
                 SettingsSection(title = "Appearance")
+            }
+
+            // Account & Sync Section
+            item {
+                SettingsSection(title = "Account & Sync")
+            }
+
+            item {
+                ClickableSettingItem(
+                    title = "Current Identity",
+                    subtitle = "${uiState.identityModeLabel}: ${uiState.currentUserId.take(18)}",
+                    onClick = { viewModel.refreshIdentityState() },
+                    enabled = !uiState.isIdentityActionInProgress
+                )
+            }
+
+            item {
+                ClickableSettingItem(
+                    title = "Sign in with Google",
+                    subtitle = "Primary account sync across devices",
+                    onClick = {
+                        activity?.let { viewModel.loginWithGoogle(it) }
+                    },
+                    enabled = !uiState.isIdentityActionInProgress && activity != null
+                )
+            }
+
+            if (!uiState.cloudSyncAvailable) {
+                item {
+                    ClickableSettingItem(
+                        title = "Use Guest Cloud Sync",
+                        subtitle = "Anonymous fallback when Google sign-in is not used",
+                        onClick = { viewModel.loginAnonymously() },
+                        enabled = !uiState.isIdentityActionInProgress
+                    )
+                }
+            }
+
+            item {
+                ClickableSettingItem(
+                    title = "Sync Now",
+                    subtitle = "Merge latest local and cloud data",
+                    onClick = { viewModel.syncNow() },
+                    enabled = !uiState.isIdentityActionInProgress
+                )
+            }
+
+            if (uiState.isIdentityActionInProgress) {
+                item {
+                    LinearProgressIndicator(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 8.dp)
+                    )
+                }
+            }
+
+            uiState.statusMessage?.let { status ->
+                item {
+                    ClickableSettingItem(
+                        title = "Sync Status",
+                        subtitle = status,
+                        onClick = { viewModel.clearStatusMessage() },
+                        enabled = true
+                    )
+                }
             }
             
             item {
@@ -182,6 +259,13 @@ fun SettingsScreen(
                     onQualityChange = { viewModel.setDownloadQuality(it) }
                 )
             }
+
+            item {
+                VideoQualitySettingItem(
+                    currentQuality = uiState.videoPlaybackQuality,
+                    onQualityChange = { viewModel.setVideoPlaybackQuality(it) }
+                )
+            }
             
             // Cache Section
             item {
@@ -215,7 +299,46 @@ fun SettingsScreen(
                     onClick = { }
                 )
             }
+
+            // Privacy Section
+            item {
+                SettingsSection(title = "Privacy")
+            }
+
+            item {
+                ClickableSettingItem(
+                    title = "Delete My Data",
+                    subtitle = "Delete cloud records, clear Room data, and reset identity",
+                    onClick = { showDeleteDataDialog = true },
+                    enabled = !uiState.isIdentityActionInProgress
+                )
+            }
         }
+    }
+
+    if (showDeleteDataDialog) {
+        AlertDialog(
+            onDismissRequest = { showDeleteDataDialog = false },
+            title = { Text("Delete My Data") },
+            text = {
+                Text("This permanently removes your synced Firestore data, clears local Room tables, and resets your user identity.")
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        showDeleteDataDialog = false
+                        viewModel.deleteMyData()
+                    }
+                ) {
+                    Text("Delete")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showDeleteDataDialog = false }) {
+                    Text("Cancel")
+                }
+            }
+        )
     }
 }
 
@@ -253,12 +376,13 @@ private fun SwitchSettingItem(
 private fun ClickableSettingItem(
     title: String,
     subtitle: String,
-    onClick: () -> Unit
+    onClick: () -> Unit,
+    enabled: Boolean = true
 ) {
     ListItem(
         headlineContent = { Text(title) },
         supportingContent = { Text(subtitle) },
-        modifier = Modifier.clickable { onClick() }
+        modifier = Modifier.clickable(enabled = enabled) { onClick() }
     )
 }
 
@@ -286,7 +410,8 @@ private fun ThemeSettingItem(
                 }
                 ExposedDropdownMenu(
                     expanded = expanded,
-                    onDismissRequest = { expanded = false }
+                    onDismissRequest = { expanded = false },
+                    modifier = Modifier.widthIn(min = 220.dp)
                 ) {
                     ThemeMode.entries.forEach { theme ->
                         DropdownMenuItem(
@@ -328,7 +453,8 @@ private fun AudioQualitySettingItem(
                 }
                 ExposedDropdownMenu(
                     expanded = expanded,
-                    onDismissRequest = { expanded = false }
+                    onDismissRequest = { expanded = false },
+                    modifier = Modifier.widthIn(min = 220.dp)
                 ) {
                     AudioQuality.entries.forEach { quality ->
                         DropdownMenuItem(
@@ -381,7 +507,8 @@ private fun CacheSizeSettingItem(
                 }
                 ExposedDropdownMenu(
                     expanded = expanded,
-                    onDismissRequest = { expanded = false }
+                    onDismissRequest = { expanded = false },
+                    modifier = Modifier.widthIn(min = 220.dp)
                 ) {
                     sizes.forEach { size ->
                         DropdownMenuItem(
@@ -398,4 +525,53 @@ private fun CacheSizeSettingItem(
             }
         }
     )
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun VideoQualitySettingItem(
+    currentQuality: Int,
+    onQualityChange: (Int) -> Unit
+) {
+    var expanded by remember { mutableStateOf(false) }
+    val qualities = listOf(144, 240, 360, 480, 720)
+
+    ListItem(
+        headlineContent = { Text("Video Playing Quality") },
+        supportingContent = { Text("${currentQuality}p") },
+        trailingContent = {
+            ExposedDropdownMenuBox(
+                expanded = expanded,
+                onExpandedChange = { expanded = it }
+            ) {
+                IconButton(
+                    onClick = { expanded = true },
+                    modifier = Modifier.menuAnchor()
+                ) {
+                    Icon(Icons.Default.ArrowDropDown, contentDescription = "Select video quality")
+                }
+                ExposedDropdownMenu(
+                    expanded = expanded,
+                    onDismissRequest = { expanded = false },
+                    modifier = Modifier.widthIn(min = 220.dp)
+                ) {
+                    qualities.forEach { quality ->
+                        DropdownMenuItem(
+                            text = { Text("${quality}p") },
+                            onClick = {
+                                onQualityChange(quality)
+                                expanded = false
+                            }
+                        )
+                    }
+                }
+            }
+        }
+    )
+}
+
+private tailrec fun Context.findActivity(): Activity? = when (this) {
+    is Activity -> this
+    is ContextWrapper -> baseContext.findActivity()
+    else -> null
 }

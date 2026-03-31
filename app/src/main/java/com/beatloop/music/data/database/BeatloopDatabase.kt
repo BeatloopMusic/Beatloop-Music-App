@@ -17,9 +17,14 @@ import com.beatloop.music.data.model.Song
         PlaylistEntity::class,
         PlaylistSongCrossRef::class,
         PlayHistoryEntry::class,
-        DownloadedSong::class
+        DownloadedSong::class,
+        ListeningSessionEvent::class,
+        InteractionSignal::class,
+        RecommendationImpression::class,
+        UserPreferenceSyncEntity::class,
+        DeletedPlaylistSyncEntity::class
     ],
-    version = 1,
+    version = 3,
     exportSchema = false
 )
 @TypeConverters(Converters::class)
@@ -31,4 +36,6 @@ abstract class BeatloopDatabase : RoomDatabase() {
     abstract fun searchHistoryDao(): SearchHistoryDao
     abstract fun playHistoryDao(): PlayHistoryDao
     abstract fun downloadedSongDao(): DownloadedSongDao
+    abstract fun recommendationDao(): RecommendationDao
+    abstract fun syncDao(): SyncDao
 }

@@ -41,6 +41,9 @@ class PlaybackControlReceiver : BroadcastReceiver() {
 
         try {
             val controller = controllerFuture.get(3, TimeUnit.SECONDS)
+            val previous = PlaybackControlStateStore.read(context)
+            var nextLikedState = previous.isLiked
+
             when (action) {
                 PlaybackControlContract.ACTION_PLAY_PAUSE -> {
                     if (controller.isPlaying) controller.pause() else controller.play()
@@ -58,11 +61,11 @@ class PlaybackControlReceiver : BroadcastReceiver() {
                     controller.sendCustomCommand(
                         SessionCommand(PlaybackControlContract.ACTION_TOGGLE_LIKE, Bundle.EMPTY),
                         Bundle.EMPTY
-                    )
+                    ).get(2, TimeUnit.SECONDS)
+                    nextLikedState = !previous.isLiked
                 }
             }
 
-            val previous = PlaybackControlStateStore.read(context)
             val currentItem = controller.currentMediaItem
             PlaybackControlStateStore.save(
                 context = context,
@@ -70,7 +73,7 @@ class PlaybackControlReceiver : BroadcastReceiver() {
                 title = currentItem?.mediaMetadata?.title?.toString().orEmpty(),
                 artist = currentItem?.mediaMetadata?.artist?.toString().orEmpty(),
                 isPlaying = controller.isPlaying,
-                isLiked = previous.isLiked
+                isLiked = nextLikedState
             )
             PlaybackControlStateStore.notifyStateChanged(context)
         } catch (error: Exception) {

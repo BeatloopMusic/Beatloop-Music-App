@@ -11,8 +11,10 @@ import com.beatloop.music.data.database.ArtistDao
 import com.beatloop.music.data.database.BeatloopDatabase
 import com.beatloop.music.data.database.PlayHistoryDao
 import com.beatloop.music.data.database.PlaylistDao
+import com.beatloop.music.data.database.RecommendationDao
 import com.beatloop.music.data.database.SearchHistoryDao
 import com.beatloop.music.data.database.SongDao
+import com.beatloop.music.data.database.SyncDao
 import dagger.Module
 import dagger.Provides
 import dagger.hilt.InstallIn
@@ -60,6 +62,14 @@ object AppModule {
     @Provides
     @Singleton
     fun providePlayHistoryDao(database: BeatloopDatabase): PlayHistoryDao = database.playHistoryDao()
+
+    @Provides
+    @Singleton
+    fun provideRecommendationDao(database: BeatloopDatabase): RecommendationDao = database.recommendationDao()
+
+    @Provides
+    @Singleton
+    fun provideSyncDao(database: BeatloopDatabase): SyncDao = database.syncDao()
     
     @Provides
     @Singleton
