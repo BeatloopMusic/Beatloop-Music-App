@@ -42,7 +42,7 @@ fun SongListItem(
             .clip(RoundedCornerShape(16.dp))
             .clickable(onClick = onClick),
         shape = RoundedCornerShape(16.dp),
-        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.56f),
+        color = MaterialTheme.colorScheme.surface.copy(alpha = 0.82f),
         tonalElevation = 1.dp,
         shadowElevation = 1.dp
     ) {
@@ -115,7 +115,7 @@ fun ArtistListItem(
             .clip(RoundedCornerShape(16.dp))
             .clickable(onClick = onClick),
         shape = RoundedCornerShape(16.dp),
-        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+        color = MaterialTheme.colorScheme.surface.copy(alpha = 0.82f),
         tonalElevation = 1.dp
     ) {
         Row(
@@ -171,7 +171,7 @@ fun AlbumCard(
             .clickable(onClick = onClick),
         shape = RoundedCornerShape(20.dp),
         colors = CardDefaults.cardColors(
-            containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.58f)
+            containerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.84f)
         ),
         elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
     ) {
@@ -222,7 +222,7 @@ fun AlbumCard(
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .background(Color.White.copy(alpha = 0.05f))
+                    .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.52f))
                     .padding(12.dp)
             ) {
                 Text(
@@ -265,7 +265,7 @@ fun PlaylistCard(
             .clickable(onClick = onClick),
         shape = RoundedCornerShape(20.dp),
         colors = CardDefaults.cardColors(
-            containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.58f)
+            containerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.84f)
         ),
         elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
     ) {
@@ -298,7 +298,7 @@ fun PlaylistCard(
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .background(Color.White.copy(alpha = 0.05f))
+                    .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.52f))
                     .padding(12.dp)
             ) {
                 Text(
@@ -348,7 +348,7 @@ fun SongCard(
             ),
         shape = RoundedCornerShape(20.dp),
         colors = CardDefaults.cardColors(
-            containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.58f)
+            containerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.84f)
         ),
         elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
     ) {
@@ -398,7 +398,7 @@ fun SongCard(
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .background(Color.White.copy(alpha = 0.05f))
+                    .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.52f))
                     .padding(12.dp)
             ) {
                 Text(

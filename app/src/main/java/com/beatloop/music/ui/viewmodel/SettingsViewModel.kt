@@ -47,6 +47,7 @@ data class SettingsUiState(
 
     // Personalization
     val contentLanguage: String = "English",
+    val contentCountry: String = "US",
     val preferredLanguages: Set<String> = setOf("English"),
 
     // Cache
@@ -155,6 +156,12 @@ class SettingsViewModel @Inject constructor(
                     val preferred = if (it.preferredLanguages.isEmpty()) setOf(language) else it.preferredLanguages
                     it.copy(contentLanguage = language, preferredLanguages = preferred)
                 }
+            }
+        }
+        viewModelScope.launch {
+            preferencesManager.contentCountry.collect { countryRaw ->
+                val country = normalizeCountryOrDefault(countryRaw)
+                _uiState.update { it.copy(contentCountry = country) }
             }
         }
         viewModelScope.launch {
@@ -434,6 +441,13 @@ class SettingsViewModel @Inject constructor(
         }
     }
 
+    fun setContentCountry(country: String) {
+        viewModelScope.launch {
+            val normalized = normalizeCountryOrDefault(country)
+            preferencesManager.setContentCountry(normalized)
+        }
+    }
+
     fun togglePreferredLanguage(language: String) {
         viewModelScope.launch {
             val normalized = normalizeLanguageOrDefault(language)
@@ -474,5 +488,9 @@ class SettingsViewModel @Inject constructor(
 
     private fun normalizeLanguageOrDefault(value: String?): String {
         return RecommendationContentRules.normalizeLanguage(value) ?: "English"
+    }
+
+    private fun normalizeCountryOrDefault(value: String?): String {
+        return RecommendationContentRules.normalizeCountry(value) ?: "US"
     }
 }

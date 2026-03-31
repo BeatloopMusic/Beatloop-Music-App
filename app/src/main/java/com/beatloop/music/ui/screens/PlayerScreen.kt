@@ -152,7 +152,6 @@ fun PlayerScreen(
     val accentColor = MaterialTheme.colorScheme.primary
     val foregroundColor = MaterialTheme.colorScheme.onBackground
     val mutedForegroundColor = foregroundColor.copy(alpha = 0.74f)
-    val chromeColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.28f)
     val currentDownloadUi = currentMediaItem?.mediaId?.let { downloadUiStateMap[it] }
     val isCurrentDownloading = currentDownloadUi?.state == DownloadState.DOWNLOADING
     val isCurrentDownloaded = uiState.isDownloaded || currentDownloadUi?.state == DownloadState.DOWNLOADED
@@ -235,9 +234,9 @@ fun PlayerScreen(
                 .background(
                     Brush.verticalGradient(
                         colors = listOf(
-                            dominantColor.copy(alpha = 0.58f),
-                            MaterialTheme.colorScheme.secondary.copy(alpha = 0.2f),
-                            MaterialTheme.colorScheme.background.copy(alpha = 0.92f)
+                            dominantColor.copy(alpha = 0.36f),
+                            MaterialTheme.colorScheme.secondary.copy(alpha = 0.1f),
+                            MaterialTheme.colorScheme.background.copy(alpha = 0.97f)
                         )
                     )
                 )
@@ -491,121 +490,112 @@ fun PlayerScreen(
             PremiumGlassSurface(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = 20.dp),
-                shape = RoundedCornerShape(24.dp),
-                tonalElevation = 3.dp
+                    .padding(horizontal = 20.dp, vertical = 10.dp),
+                shape = RoundedCornerShape(28.dp),
+                tonalElevation = 4.dp
             ) {
                 Column(
-                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 14.dp)
                 ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = formatDuration(currentPosition),
+                            style = MaterialTheme.typography.labelMedium,
+                            color = mutedForegroundColor
+                        )
+                        Text(
+                            text = formatDuration(duration),
+                            style = MaterialTheme.typography.labelMedium,
+                            color = mutedForegroundColor
+                        )
+                    }
+
                     Slider(
                         value = if (duration > 0) currentPosition.toFloat() / duration else 0f,
                         onValueChange = { value ->
                             playerConnection?.seekTo((value * duration).toLong())
                         },
+                        modifier = Modifier.padding(top = 2.dp),
                         colors = SliderDefaults.colors(
                             thumbColor = accentColor,
                             activeTrackColor = accentColor,
-                            inactiveTrackColor = foregroundColor.copy(alpha = 0.28f)
+                            inactiveTrackColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.16f)
                         )
                     )
 
+                    Spacer(modifier = Modifier.height(10.dp))
+
                     Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 2.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text(
-                            text = formatDuration(currentPosition),
-                            style = MaterialTheme.typography.bodySmall,
-                            color = mutedForegroundColor
-                        )
-                        Text(
-                            text = formatDuration(duration),
-                            style = MaterialTheme.typography.bodySmall,
-                            color = mutedForegroundColor
-                        )
-                    }
-                }
-            }
+                        IconButton(onClick = { playerConnection?.toggleShuffle() }) {
+                            Icon(
+                                imageVector = Icons.Default.Shuffle,
+                                contentDescription = "Shuffle",
+                                tint = if (shuffleModeEnabled) accentColor else mutedForegroundColor
+                            )
+                        }
 
-            PremiumGlassSurface(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 20.dp, vertical = 18.dp),
-                shape = RoundedCornerShape(24.dp),
-                tonalElevation = 4.dp
-            ) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 10.dp, vertical = 8.dp),
-                    horizontalArrangement = Arrangement.SpaceEvenly,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    // Shuffle
-                    IconButton(onClick = { playerConnection?.toggleShuffle() }) {
-                        Icon(
-                            imageVector = Icons.Default.Shuffle,
-                            contentDescription = "Shuffle",
-                            tint = if (shuffleModeEnabled) accentColor else mutedForegroundColor
-                        )
-                    }
+                        IconButton(
+                            onClick = { playerConnection?.skipToPrevious() },
+                            modifier = Modifier.size(52.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.SkipPrevious,
+                                contentDescription = "Previous",
+                                tint = foregroundColor,
+                                modifier = Modifier.size(34.dp)
+                            )
+                        }
 
-                    // Previous
-                    IconButton(
-                        onClick = { playerConnection?.skipToPrevious() },
-                        modifier = Modifier.size(56.dp)
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.SkipPrevious,
-                            contentDescription = "Previous",
-                            tint = foregroundColor,
-                            modifier = Modifier.size(40.dp)
-                        )
-                    }
+                        FloatingActionButton(
+                            onClick = { playerConnection?.togglePlayPause() },
+                            modifier = Modifier.size(68.dp),
+                            containerColor = accentColor,
+                            contentColor = MaterialTheme.colorScheme.onPrimary,
+                            shape = CircleShape
+                        ) {
+                            Icon(
+                                imageVector = if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
+                                contentDescription = if (isPlaying) "Pause" else "Play",
+                                modifier = Modifier.size(36.dp)
+                            )
+                        }
 
-                    // Play/Pause
-                    FloatingActionButton(
-                        onClick = { playerConnection?.togglePlayPause() },
-                        modifier = Modifier.size(72.dp),
-                        containerColor = accentColor,
-                        contentColor = MaterialTheme.colorScheme.onPrimary,
-                        shape = CircleShape
-                    ) {
-                        Icon(
-                            imageVector = if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
-                            contentDescription = if (isPlaying) "Pause" else "Play",
-                            modifier = Modifier.size(40.dp)
-                        )
-                    }
+                        IconButton(
+                            onClick = { playerConnection?.skipToNext() },
+                            modifier = Modifier.size(52.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.SkipNext,
+                                contentDescription = "Next",
+                                tint = foregroundColor,
+                                modifier = Modifier.size(34.dp)
+                            )
+                        }
 
-                    // Next
-                    IconButton(
-                        onClick = { playerConnection?.skipToNext() },
-                        modifier = Modifier.size(56.dp)
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.SkipNext,
-                            contentDescription = "Next",
-                            tint = foregroundColor,
-                            modifier = Modifier.size(40.dp)
-                        )
-                    }
-
-                    // Repeat
-                    IconButton(onClick = { playerConnection?.cycleRepeatMode() }) {
-                        Icon(
-                            imageVector = when (repeatMode) {
-                                Player.REPEAT_MODE_ONE -> Icons.Default.RepeatOne
-                                else -> Icons.Default.Repeat
-                            },
-                            contentDescription = "Repeat",
-                            tint = if (repeatMode != Player.REPEAT_MODE_OFF) {
-                                accentColor
-                            } else {
-                                mutedForegroundColor
-                            }
-                        )
+                        IconButton(onClick = { playerConnection?.cycleRepeatMode() }) {
+                            Icon(
+                                imageVector = when (repeatMode) {
+                                    Player.REPEAT_MODE_ONE -> Icons.Default.RepeatOne
+                                    else -> Icons.Default.Repeat
+                                },
+                                contentDescription = "Repeat",
+                                tint = if (repeatMode != Player.REPEAT_MODE_OFF) {
+                                    accentColor
+                                } else {
+                                    mutedForegroundColor
+                                }
+                            )
+                        }
                     }
                 }
             }
