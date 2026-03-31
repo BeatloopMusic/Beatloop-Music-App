@@ -18,7 +18,10 @@ class HybridRecommendationEngine @Inject constructor(
         val scored = candidates
             .asSequence()
             .filter { candidate ->
-                candidate.song.id.isNotBlank() && !context.queueSongIds.contains(candidate.song.id)
+                candidate.song.id.isNotBlank() &&
+                    !context.queueSongIds.contains(candidate.song.id) &&
+                    RecommendationContentRules.isTrackAllowed(candidate.song) &&
+                    matchesLanguagePolicy(candidate, context)
             }
             .map { candidate ->
                 val songId = candidate.song.id
@@ -157,6 +160,23 @@ class HybridRecommendationEngine @Inject constructor(
             features.sourceScore +
             features.explorationScore -
             features.antiRepetitionPenalty
+    }
+
+    private fun matchesLanguagePolicy(
+        candidate: RecommendationCandidate,
+        context: RecommendationContext
+    ): Boolean {
+        if (context.enforcedLanguages.isEmpty()) return true
+
+        val allowUnknownLanguage = candidate.source == RecommendationSource.RECENT ||
+            candidate.source == RecommendationSource.PERSONALIZATION_SEED ||
+            candidate.source == RecommendationSource.ONBOARDING
+
+        return RecommendationContentRules.matchesAllowedLanguages(
+            song = candidate.song,
+            allowedLanguages = context.enforcedLanguages,
+            allowUnknownLanguage = allowUnknownLanguage
+        )
     }
 
     private fun enforceArtistDiversity(scored: List<ScoredRecommendation>): List<ScoredRecommendation> {

@@ -9,10 +9,12 @@ import com.beatloop.music.data.database.SongBehaviorMetrics
 import com.beatloop.music.data.database.SongDao
 import com.beatloop.music.data.database.SongInteractionMetrics
 import com.beatloop.music.data.model.SongItem
+import com.beatloop.music.data.model.Song
 import com.beatloop.music.data.preferences.PreferencesManager
 import com.beatloop.music.domain.recommendation.HybridRecommendationEngine
 import com.beatloop.music.domain.recommendation.ProfileVector
 import com.beatloop.music.domain.recommendation.RecommendationCandidate
+import com.beatloop.music.domain.recommendation.RecommendationContentRules
 import com.beatloop.music.domain.recommendation.RecommendationContext
 import com.beatloop.music.domain.recommendation.RecommendationFeatureEngineer
 import com.beatloop.music.domain.recommendation.SongBehaviorSignal
@@ -40,6 +42,7 @@ class RecommendationRepository @Inject constructor(
 
     private data class RecommendationProfile(
         val languages: Set<String> = emptySet(),
+        val enforcedLanguages: Set<String> = emptySet(),
         val singers: Set<String> = emptySet(),
         val lyricists: Set<String> = emptySet(),
         val musicDirectors: Set<String> = emptySet(),
@@ -60,8 +63,17 @@ class RecommendationRepository @Inject constructor(
         if (candidates.isEmpty() || limit <= 0) return emptyList()
 
         val now = System.currentTimeMillis()
+        val profile = loadRecommendationProfile()
+        val eligibleCandidates = filterCandidatesForPolicy(candidates, profile.enforcedLanguages)
+        if (eligibleCandidates.isEmpty()) return emptyList()
+
         val currentVersion = synchronized(cacheLock) { recommendationVersion }
-        val cacheKey = buildHomeCacheKey(candidates, topArtistWeights, refreshNonce)
+        val cacheKey = buildHomeCacheKey(
+            candidates = eligibleCandidates,
+            topArtistWeights = topArtistWeights,
+            refreshNonce = refreshNonce,
+            enforcedLanguages = profile.enforcedLanguages
+        )
 
         synchronized(cacheLock) {
             val cached = homeRecommendationCache
@@ -75,7 +87,6 @@ class RecommendationRepository @Inject constructor(
             }
         }
 
-        val profile = loadRecommendationProfile()
         val behaviorSignals = buildBehaviorSignals(now)
         val interactionSignals = buildInteractionSignals(now)
         val recentListened = recommendationDao.getRecentlyListenedSongIds(limit = 60).toSet()
@@ -89,6 +100,7 @@ class RecommendationRepository @Inject constructor(
             recentRecommendationIds = recentRecommended,
             topArtistWeights = topArtistWeights.mapKeys { (artist, _) -> artist.trim().lowercase() }
                 .mapValues { (_, weight) -> weight.toDouble() },
+            enforcedLanguages = profile.enforcedLanguages,
             preferredLanguages = profile.languages,
             preferredSingers = profile.singers,
             preferredLyricists = profile.lyricists,
@@ -98,7 +110,7 @@ class RecommendationRepository @Inject constructor(
 
         val ranked = hybridRecommendationEngine
             .rankCandidates(
-                candidates = candidates,
+                candidates = eligibleCandidates,
                 behaviorBySong = behaviorSignals,
                 interactionBySong = interactionSignals,
                 context = context,
@@ -128,6 +140,9 @@ class RecommendationRepository @Inject constructor(
 
         val now = System.currentTimeMillis()
         val profile = loadRecommendationProfile()
+        val eligibleCandidates = filterCandidatesForPolicy(candidates, profile.enforcedLanguages)
+        if (eligibleCandidates.isEmpty()) return emptyList()
+
         val behaviorSignals = buildBehaviorSignals(now)
         val interactionSignals = buildInteractionSignals(now)
         val recentListened = recommendationDao.getRecentlyListenedSongIds(limit = 60).toSet()
@@ -149,6 +164,7 @@ class RecommendationRepository @Inject constructor(
             recentRecommendationIds = recentRecommended,
             queueSongIds = queueSongIds,
             topArtistWeights = emptyMap(),
+            enforcedLanguages = profile.enforcedLanguages,
             preferredLanguages = profile.languages,
             preferredSingers = profile.singers,
             preferredLyricists = profile.lyricists,
@@ -159,7 +175,7 @@ class RecommendationRepository @Inject constructor(
 
         val ranked = if (seedSongId.isNullOrBlank()) {
             hybridRecommendationEngine.rankCandidates(
-                candidates = candidates,
+                candidates = eligibleCandidates,
                 behaviorBySong = behaviorSignals,
                 interactionBySong = interactionSignals,
                 context = context,
@@ -168,7 +184,7 @@ class RecommendationRepository @Inject constructor(
         } else {
             hybridRecommendationEngine.rankNextSongPredictions(
                 seedSongId = seedSongId,
-                candidates = candidates,
+                candidates = eligibleCandidates,
                 behaviorBySong = behaviorSignals,
                 interactionBySong = interactionSignals,
                 context = context,
@@ -280,11 +296,14 @@ class RecommendationRepository @Inject constructor(
 
     private suspend fun loadRecommendationProfile(): RecommendationProfile {
         val onboardingCompleted = preferencesManager.onboardingCompleted.first()
-        val languages = if (onboardingCompleted) {
-            preferencesManager.preferredLanguages.first().filterNot { it.equals("None", ignoreCase = true) }.toSet()
-        } else {
-            emptySet()
-        }
+        val preferredLanguages = RecommendationContentRules.normalizeLanguages(
+            preferencesManager.preferredLanguages.first().filterNot { it.equals("None", ignoreCase = true) }
+        )
+        val contentLanguage = RecommendationContentRules.normalizeLanguage(preferencesManager.contentLanguage.first())
+        val defaultLanguage = contentLanguage?.let { setOf(it) }.orEmpty()
+
+        val selectedLanguages = if (preferredLanguages.isNotEmpty()) preferredLanguages else defaultLanguage
+
         val singers = if (onboardingCompleted) {
             preferencesManager.preferredSingers.first().filterNot { it.equals("None", ignoreCase = true) }.toSet()
         } else {
@@ -301,9 +320,25 @@ class RecommendationRepository @Inject constructor(
             emptySet()
         }
 
+        val seedSongs = songDao.getPersonalizationSeedSongs(limit = 250)
         val recentQueries = recommendationDao.getRecentSearchQueries(limit = 40)
+        val queryLanguages = recentQueries
+            .asSequence()
+            .flatMap { query -> RecommendationContentRules.inferLanguagesFromText(query).asSequence() }
+            .toSet()
+
+        val frequentPlaybackLanguages = inferFrequentPlaybackLanguages(seedSongs)
+
+        val enforcedLanguages = when {
+            selectedLanguages.isNotEmpty() -> selectedLanguages + frequentPlaybackLanguages + queryLanguages
+            frequentPlaybackLanguages.isNotEmpty() -> frequentPlaybackLanguages + queryLanguages
+            else -> queryLanguages
+        }
+
+        val profileLanguages = (selectedLanguages + frequentPlaybackLanguages + queryLanguages)
+
         val profileVector = featureEngineer.buildProfileVector(
-            languages = languages,
+            languages = profileLanguages,
             singers = singers,
             lyricists = lyricists,
             musicDirectors = musicDirectors,
@@ -311,7 +346,8 @@ class RecommendationRepository @Inject constructor(
         )
 
         return RecommendationProfile(
-            languages = languages,
+            languages = profileLanguages,
+            enforcedLanguages = enforcedLanguages,
             singers = singers,
             lyricists = lyricists,
             musicDirectors = musicDirectors,
@@ -378,14 +414,67 @@ class RecommendationRepository @Inject constructor(
     private fun buildHomeCacheKey(
         candidates: List<RecommendationCandidate>,
         topArtistWeights: Map<String, Int>,
-        refreshNonce: Long
+        refreshNonce: Long,
+        enforcedLanguages: Set<String>
     ): String {
         val idsKey = candidates.joinToString(separator = "|") { it.song.id }
         val artistKey = topArtistWeights.entries
             .sortedByDescending { (_, weight) -> weight }
             .joinToString(separator = "|") { (artist, weight) -> "${artist.lowercase()}:$weight" }
+        val languageKey = enforcedLanguages.sorted().joinToString(separator = "|") { it.lowercase() }
         val nonceBucket = refreshNonce / 15_000L
-        return "$idsKey#$artistKey#$nonceBucket"
+        return "$idsKey#$artistKey#$languageKey#$nonceBucket"
+    }
+
+    private fun filterCandidatesForPolicy(
+        candidates: List<RecommendationCandidate>,
+        enforcedLanguages: Set<String>
+    ): List<RecommendationCandidate> {
+        val trackEligible = candidates
+            .asSequence()
+            .filter { candidate ->
+                candidate.song.id.isNotBlank() && RecommendationContentRules.isTrackAllowed(candidate.song)
+            }
+            .distinctBy { candidate -> candidate.song.id }
+            .toList()
+
+        if (enforcedLanguages.isEmpty()) {
+            return trackEligible
+        }
+
+        return trackEligible.filter { candidate ->
+            RecommendationContentRules.matchesAllowedLanguages(
+                song = candidate.song,
+                allowedLanguages = enforcedLanguages,
+                allowUnknownLanguage = shouldAllowUnknownLanguage(candidate.source)
+            )
+        }
+    }
+
+    private fun shouldAllowUnknownLanguage(source: com.beatloop.music.domain.recommendation.RecommendationSource): Boolean {
+        return source == com.beatloop.music.domain.recommendation.RecommendationSource.RECENT ||
+            source == com.beatloop.music.domain.recommendation.RecommendationSource.PERSONALIZATION_SEED ||
+            source == com.beatloop.music.domain.recommendation.RecommendationSource.ONBOARDING
+    }
+
+    private fun inferFrequentPlaybackLanguages(seedSongs: List<Song>): Set<String> {
+        if (seedSongs.isEmpty()) return emptySet()
+
+        val weighted = mutableMapOf<String, Int>()
+        seedSongs.forEach { song ->
+            val inferred = RecommendationContentRules.inferLanguagesFromText("${song.title} ${song.artistsText}")
+            if (inferred.isEmpty()) return@forEach
+
+            val weight = song.playCount.coerceAtLeast(1).coerceAtMost(24)
+            inferred.forEach { language ->
+                weighted[language] = (weighted[language] ?: 0) + weight
+            }
+        }
+
+        return weighted
+            .filterValues { score -> score >= FREQUENT_LANGUAGE_PLAY_SCORE_THRESHOLD }
+            .keys
+            .toSet()
     }
 
     private suspend fun cleanupTrackingDataIfNeeded(nowMs: Long) {
@@ -419,5 +508,6 @@ class RecommendationRepository @Inject constructor(
         private const val RECENT_RECOMMENDATION_WINDOW_MS = 12L * 60L * 60L * 1000L
         private const val CLEANUP_INTERVAL_MS = 12L * 60L * 60L * 1000L
         private const val HOME_CACHE_TTL_MS = 2L * 60L * 1000L
+        private const val FREQUENT_LANGUAGE_PLAY_SCORE_THRESHOLD = 8
     }
 }

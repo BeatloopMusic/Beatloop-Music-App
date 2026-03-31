@@ -853,27 +853,36 @@ class MusicService : MediaSessionService() {
     }
 
     private fun refreshPlaybackControlState() {
-        val currentItem = player?.currentMediaItem
-        val mediaId = currentItem?.mediaId ?: ""
-        val title = currentItem?.mediaMetadata?.title?.toString().orEmpty().ifBlank { "Nothing playing" }
-        val artist = currentItem?.mediaMetadata?.artist?.toString().orEmpty().ifBlank { "Beatloop" }
-        val isPlaying = player?.isPlaying == true
-
-        serviceScope.launch(Dispatchers.IO) {
-            val isLiked = if (mediaId.isBlank()) {
-                false
-            } else {
-                runCatching { musicRepository.isSongLiked(mediaId) }.getOrDefault(false)
+        serviceScope.launch {
+            val playbackSnapshot = withContext(Dispatchers.Main.immediate) {
+                val currentItem = player?.currentMediaItem
+                PlaybackControlStateStore.Snapshot(
+                    mediaId = currentItem?.mediaId ?: "",
+                    title = currentItem?.mediaMetadata?.title?.toString().orEmpty().ifBlank { "Nothing playing" },
+                    artist = currentItem?.mediaMetadata?.artist?.toString().orEmpty().ifBlank { "Beatloop" },
+                    isPlaying = player?.isPlaying == true,
+                    isLiked = false
+                )
             }
 
-            PlaybackControlStateStore.save(
-                context = this@MusicService,
-                mediaId = mediaId,
-                title = title,
-                artist = artist,
-                isPlaying = isPlaying,
-                isLiked = isLiked
-            )
+            val isLiked = if (playbackSnapshot.mediaId.isBlank()) {
+                false
+            } else {
+                withContext(Dispatchers.IO) {
+                    runCatching { musicRepository.isSongLiked(playbackSnapshot.mediaId) }.getOrDefault(false)
+                }
+            }
+
+            withContext(Dispatchers.IO) {
+                PlaybackControlStateStore.save(
+                    context = this@MusicService,
+                    mediaId = playbackSnapshot.mediaId,
+                    title = playbackSnapshot.title,
+                    artist = playbackSnapshot.artist,
+                    isPlaying = playbackSnapshot.isPlaying,
+                    isLiked = isLiked
+                )
+            }
             PlaybackControlStateStore.notifyStateChanged(this@MusicService)
         }
     }

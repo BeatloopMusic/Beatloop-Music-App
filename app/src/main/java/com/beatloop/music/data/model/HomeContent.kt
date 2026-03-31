@@ -11,10 +11,17 @@ data class HomeContent(
     val recentlyPlayed: List<SongItem> = emptyList(),
     val topArtists: List<String> = emptyList(),
     val trendingSongs: List<SongItem> = emptyList(),
+    val genreSections: List<GenreRecommendationSection> = emptyList(),
     val newReleases: List<AlbumItem> = emptyList(),
     val recommendedPlaylists: List<PlaylistItem> = emptyList(),
     val moodsAndGenres: List<MoodGenreItem> = emptyList(),
     val charts: List<ChartItem> = emptyList()
+)
+
+@Serializable
+data class GenreRecommendationSection(
+    val title: String,
+    val songs: List<SongItem> = emptyList()
 )
 
 @Serializable

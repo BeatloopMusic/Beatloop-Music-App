@@ -135,6 +135,7 @@ dependencies {
     implementation(platform(libs.firebase.bom))
     implementation(libs.firebase.auth.ktx)
     implementation(libs.firebase.firestore.ktx)
+    implementation(libs.play.services.auth)
     
     // DataStore
     implementation(libs.androidx.datastore.preferences)

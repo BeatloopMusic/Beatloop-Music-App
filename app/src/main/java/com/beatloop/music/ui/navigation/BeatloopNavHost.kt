@@ -4,6 +4,8 @@ import androidx.compose.animation.AnimatedContentTransitionScope
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.scaleOut
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.navigation.NavHostController
@@ -31,33 +33,64 @@ fun BeatloopNavHost(
     startDestination: String,
     modifier: Modifier = Modifier
 ) {
+    val topLevelRoutes = setOf(
+        Screen.Home.route,
+        Screen.Search.route,
+        Screen.Library.route,
+        Screen.Settings.route
+    )
+
     NavHost(
         navController = navController,
         startDestination = startDestination,
         modifier = modifier,
         enterTransition = {
-            slideIntoContainer(
-                towards = AnimatedContentTransitionScope.SlideDirection.Left,
-                animationSpec = tween(340)
-            ) + fadeIn(animationSpec = tween(240))
+            val fromRoute = initialState.destination.route.toBaseRoute()
+            val toRoute = targetState.destination.route.toBaseRoute()
+            if (fromRoute in topLevelRoutes && toRoute in topLevelRoutes) {
+                fadeIn(animationSpec = tween(220)) + scaleIn(initialScale = 0.985f)
+            } else {
+                slideIntoContainer(
+                    towards = AnimatedContentTransitionScope.SlideDirection.Left,
+                    animationSpec = tween(340)
+                ) + fadeIn(animationSpec = tween(240))
+            }
         },
         exitTransition = {
-            slideOutOfContainer(
-                towards = AnimatedContentTransitionScope.SlideDirection.Left,
-                animationSpec = tween(260)
-            ) + fadeOut(animationSpec = tween(200))
+            val fromRoute = initialState.destination.route.toBaseRoute()
+            val toRoute = targetState.destination.route.toBaseRoute()
+            if (fromRoute in topLevelRoutes && toRoute in topLevelRoutes) {
+                fadeOut(animationSpec = tween(180)) + scaleOut(targetScale = 1.01f)
+            } else {
+                slideOutOfContainer(
+                    towards = AnimatedContentTransitionScope.SlideDirection.Left,
+                    animationSpec = tween(260)
+                ) + fadeOut(animationSpec = tween(200))
+            }
         },
         popEnterTransition = {
-            slideIntoContainer(
-                towards = AnimatedContentTransitionScope.SlideDirection.Right,
-                animationSpec = tween(300)
-            ) + fadeIn(animationSpec = tween(220))
+            val fromRoute = initialState.destination.route.toBaseRoute()
+            val toRoute = targetState.destination.route.toBaseRoute()
+            if (fromRoute in topLevelRoutes && toRoute in topLevelRoutes) {
+                fadeIn(animationSpec = tween(220)) + scaleIn(initialScale = 0.99f)
+            } else {
+                slideIntoContainer(
+                    towards = AnimatedContentTransitionScope.SlideDirection.Right,
+                    animationSpec = tween(300)
+                ) + fadeIn(animationSpec = tween(220))
+            }
         },
         popExitTransition = {
-            slideOutOfContainer(
-                towards = AnimatedContentTransitionScope.SlideDirection.Right,
-                animationSpec = tween(260)
-            ) + fadeOut(animationSpec = tween(200))
+            val fromRoute = initialState.destination.route.toBaseRoute()
+            val toRoute = targetState.destination.route.toBaseRoute()
+            if (fromRoute in topLevelRoutes && toRoute in topLevelRoutes) {
+                fadeOut(animationSpec = tween(180)) + scaleOut(targetScale = 1.01f)
+            } else {
+                slideOutOfContainer(
+                    towards = AnimatedContentTransitionScope.SlideDirection.Right,
+                    animationSpec = tween(260)
+                ) + fadeOut(animationSpec = tween(200))
+            }
         }
     ) {
         composable(Screen.Onboarding.route) {
@@ -193,4 +226,10 @@ fun BeatloopNavHost(
             )
         }
     }
+}
+
+private fun String?.toBaseRoute(): String? {
+    return this
+        ?.substringBefore("?")
+        ?.substringBefore("/")
 }

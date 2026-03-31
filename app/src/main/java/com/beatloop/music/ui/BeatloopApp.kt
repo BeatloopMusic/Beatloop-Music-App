@@ -4,11 +4,16 @@ import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.scaleOut
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.offset
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Scaffold
 import androidx.compose.runtime.Composable
@@ -27,10 +32,12 @@ import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import com.beatloop.music.ui.components.BottomNavigationBar
 import com.beatloop.music.ui.components.MiniPlayer
+import com.beatloop.music.ui.components.PremiumScreenBackground
 import com.beatloop.music.ui.navigation.BeatloopNavHost
 import com.beatloop.music.ui.navigation.Screen
 import com.beatloop.music.ui.screens.PlayerScreen
 import com.beatloop.music.ui.viewmodel.AppEntryViewModel
+import androidx.compose.ui.unit.dp
 
 @Composable
 fun BeatloopApp() {
@@ -85,8 +92,10 @@ fun BeatloopApp() {
         (normalizedRoute == null && onboardingCompleted) || normalizedRoute in topLevelRoutes
     }
     
-    val shouldShowMiniPlayer = remember(playerConnection, showFullPlayer, shouldShowBottomBar) {
-        playerConnection?.currentMediaItem != null && !showFullPlayer && shouldShowBottomBar
+    val shouldShowMiniPlayer = remember(playerConnection, showFullPlayer, normalizedRoute) {
+        playerConnection?.currentMediaItem != null &&
+            !showFullPlayer &&
+            normalizedRoute != Screen.Onboarding.route
     }
     
     Box(modifier = Modifier.fillMaxSize()) {
@@ -94,42 +103,61 @@ fun BeatloopApp() {
             showFullPlayer = false
         }
 
-        Scaffold(
-            bottomBar = {
-                AnimatedVisibility(
-                    visible = shouldShowBottomBar,
-                    enter = fadeIn() + slideInVertically { it },
-                    exit = fadeOut() + slideOutVertically { it }
-                ) {
-                    BottomNavigationBar(
-                        navController = navController,
-                        currentRoute = currentRoute
-                    )
+        PremiumScreenBackground {
+            Scaffold(
+                containerColor = androidx.compose.ui.graphics.Color.Transparent,
+                bottomBar = {
+                    AnimatedVisibility(
+                        visible = shouldShowBottomBar,
+                        enter = fadeIn(animationSpec = tween(220)) + slideInVertically(
+                            animationSpec = tween(260),
+                            initialOffsetY = { it / 2 }
+                        ),
+                        exit = fadeOut(animationSpec = tween(180)) + slideOutVertically(
+                            animationSpec = tween(220),
+                            targetOffsetY = { it / 2 }
+                        )
+                    ) {
+                        BottomNavigationBar(
+                            navController = navController,
+                            currentRoute = currentRoute,
+                            modifier = Modifier
+                                .padding(horizontal = 12.dp, vertical = 8.dp)
+                                .navigationBarsPadding()
+                        )
+                    }
                 }
-            }
-        ) { innerPadding ->
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(innerPadding)
-            ) {
-                BeatloopNavHost(
-                    navController = navController,
-                    startDestination = startDestination,
-                    modifier = Modifier.fillMaxSize()
-                )
-                
-                // Mini Player
-                AnimatedVisibility(
-                    visible = shouldShowMiniPlayer == true,
-                    enter = fadeIn() + slideInVertically { it },
-                    exit = fadeOut() + slideOutVertically { it },
-                    modifier = Modifier.align(Alignment.BottomCenter)
+            ) { innerPadding ->
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(innerPadding)
                 ) {
-                    MiniPlayer(
-                        playerConnection = playerConnection,
-                        onClick = { showFullPlayer = true }
+                    BeatloopNavHost(
+                        navController = navController,
+                        startDestination = startDestination,
+                        modifier = Modifier.fillMaxSize()
                     )
+
+                    AnimatedVisibility(
+                        visible = shouldShowMiniPlayer == true,
+                        enter = fadeIn(animationSpec = tween(220)) + slideInVertically(
+                            animationSpec = tween(260),
+                            initialOffsetY = { it / 2 }
+                        ) + scaleIn(initialScale = 0.96f),
+                        exit = fadeOut(animationSpec = tween(180)) + slideOutVertically(
+                            animationSpec = tween(220),
+                            targetOffsetY = { it / 2 }
+                        ) + scaleOut(targetScale = 0.96f),
+                        modifier = Modifier
+                            .align(Alignment.BottomCenter)
+                            .offset(y = if (shouldShowBottomBar) (-72).dp else (-12).dp)
+                    ) {
+                        MiniPlayer(
+                            playerConnection = playerConnection,
+                            onClick = { showFullPlayer = true }
+                        )
+                    }
                 }
             }
         }
@@ -139,12 +167,12 @@ fun BeatloopApp() {
             visible = showFullPlayer,
             enter = slideInVertically(
                 initialOffsetY = { it },
-                animationSpec = tween(300)
-            ) + fadeIn(),
+                animationSpec = tween(340)
+            ) + fadeIn(animationSpec = tween(280)),
             exit = slideOutVertically(
                 targetOffsetY = { it },
-                animationSpec = tween(300)
-            ) + fadeOut()
+                animationSpec = tween(280)
+            ) + fadeOut(animationSpec = tween(220))
         ) {
             PlayerScreen(
                 onDismiss = { showFullPlayer = false }

@@ -21,7 +21,7 @@ class PlaybackControlReceiver : BroadcastReceiver() {
         val action = intent.action ?: return
         val pendingResult = goAsync()
 
-        CoroutineScope(Dispatchers.Main).launch {
+        CoroutineScope(Dispatchers.IO).launch {
             try {
                 handleAction(context, action)
             } finally {

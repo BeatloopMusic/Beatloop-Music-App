@@ -3,6 +3,7 @@ package com.beatloop.music.ui.viewmodel
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.beatloop.music.data.model.AlbumItem
+import com.beatloop.music.data.model.GenreRecommendationSection
 import com.beatloop.music.data.model.PlaylistItem
 import com.beatloop.music.data.model.SongItem
 import com.beatloop.music.domain.usecase.home.GetHomeContentUseCase
@@ -29,6 +30,7 @@ data class HomeUiState(
     val recentlyPlayed: List<SongItem> = emptyList(),
     val topArtists: List<String> = emptyList(),
     val trendingSongs: List<SongItem> = emptyList(),
+    val genreSections: List<GenreRecommendationSection> = emptyList(),
     val newReleases: List<AlbumItem> = emptyList(),
     val recommendedPlaylists: List<PlaylistItem> = emptyList(),
     val networkStatus: NetworkStatus = NetworkStatus.Available,
@@ -50,6 +52,7 @@ class HomeViewModel @Inject constructor(
     init {
         _uiState.update { it.copy(greeting = getGreeting()) }
         observeNetworkStatus()
+        loadHome(forceRefresh = false)
     }
     
     private fun observeNetworkStatus() {
@@ -93,6 +96,7 @@ class HomeViewModel @Inject constructor(
             _uiState.value.personalizedRecommendations.isNotEmpty() ||
             _uiState.value.recentlyPlayed.isNotEmpty() ||
             _uiState.value.trendingSongs.isNotEmpty() ||
+            _uiState.value.genreSections.isNotEmpty() ||
             _uiState.value.newReleases.isNotEmpty() ||
             _uiState.value.recommendedPlaylists.isNotEmpty()
 
@@ -128,6 +132,7 @@ class HomeViewModel @Inject constructor(
                             recentlyPlayed = homeContent.recentlyPlayed,
                             topArtists = homeContent.topArtists,
                             trendingSongs = homeContent.trendingSongs,
+                            genreSections = homeContent.genreSections,
                             newReleases = homeContent.newReleases,
                             recommendedPlaylists = homeContent.recommendedPlaylists
                         )

@@ -20,6 +20,7 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
@@ -48,6 +49,8 @@ import coil.request.ImageRequest
 import com.beatloop.music.data.model.SongItem
 import com.beatloop.music.data.model.DownloadState
 import com.beatloop.music.ui.LocalPlayerConnection
+import com.beatloop.music.ui.components.PremiumFilterChipRow
+import com.beatloop.music.ui.components.PremiumGlassSurface
 import com.beatloop.music.ui.navigation.Screen
 import com.beatloop.music.ui.viewmodel.SongActionsViewModel
 import com.beatloop.music.ui.viewmodel.PlayerViewModel
@@ -80,7 +83,7 @@ fun PlayerScreen(
 
     val sheetState = rememberModalBottomSheetState()
     var showQueue by remember { mutableStateOf(false) }
-    var showLyrics by remember { mutableStateOf(false) }
+    var activePanel by rememberSaveable { mutableStateOf("Visual") }
     var showSleepTimerDialog by remember { mutableStateOf(false) }
     var showAddToPlaylist by remember { mutableStateOf(false) }
     var showCreatePlaylist by remember { mutableStateOf(false) }
@@ -204,34 +207,53 @@ fun PlayerScreen(
             applyPlaybackMode(videoMode = true, quality = preferredVideoQuality)
         }
     }
+
+    LaunchedEffect(showQueue, activePanel) {
+        if (!showQueue && activePanel == "Queue") {
+            activePanel = "Visual"
+        }
+    }
     
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(
-                Brush.verticalGradient(
-                    colors = listOf(
-                        dominantColor.copy(alpha = 0.62f),
-                        MaterialTheme.colorScheme.secondary.copy(alpha = 0.2f),
-                        MaterialTheme.colorScheme.background
+            .background(MaterialTheme.colorScheme.background)
+    ) {
+        AsyncImage(
+            model = artworkUrl,
+            contentDescription = null,
+            modifier = Modifier
+                .fillMaxSize()
+                .blur(86.dp),
+            contentScale = ContentScale.Crop,
+            alpha = 0.33f
+        )
+
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(
+                    Brush.verticalGradient(
+                        colors = listOf(
+                            dominantColor.copy(alpha = 0.58f),
+                            MaterialTheme.colorScheme.secondary.copy(alpha = 0.2f),
+                            MaterialTheme.colorScheme.background.copy(alpha = 0.92f)
+                        )
                     )
                 )
-            )
-    ) {
+        )
+
         Column(
             modifier = Modifier
                 .fillMaxSize()
                 .statusBarsPadding()
         ) {
-            // Top Bar
-            Surface(
+            PremiumGlassSurface(
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(horizontal = 16.dp, vertical = 8.dp),
-                shape = RoundedCornerShape(0.dp),
-                color = Color.Transparent,
-                tonalElevation = 0.dp,
-                shadowElevation = 0.dp
+                shape = RoundedCornerShape(22.dp),
+                tonalElevation = 4.dp
             ) {
                 Row(
                     modifier = Modifier
@@ -256,7 +278,10 @@ fun PlayerScreen(
                         color = foregroundColor
                     )
 
-                    IconButton(onClick = { showQueue = true }) {
+                    IconButton(onClick = {
+                        activePanel = "Queue"
+                        showQueue = true
+                    }) {
                         Icon(
                             imageVector = Icons.AutoMirrored.Filled.QueueMusic,
                             contentDescription = "Queue",
@@ -265,8 +290,22 @@ fun PlayerScreen(
                     }
                 }
             }
-            
-            // Album Art / Lyrics View
+
+            PremiumFilterChipRow(
+                items = listOf("Visual", "Lyrics", "Queue"),
+                selectedItem = activePanel,
+                onItemSelected = { selected ->
+                    when (selected) {
+                        "Queue" -> {
+                            activePanel = "Queue"
+                            showQueue = true
+                        }
+
+                        else -> activePanel = selected
+                    }
+                }
+            )
+
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -274,19 +313,21 @@ fun PlayerScreen(
                     .padding(horizontal = 32.dp)
                     .pointerInput(Unit) {
                         detectTapGestures(
-                            onTap = { showLyrics = !showLyrics }
+                            onTap = {
+                                activePanel = if (activePanel == "Lyrics") "Visual" else "Lyrics"
+                            }
                         )
                     },
                 contentAlignment = Alignment.Center
             ) {
                 AnimatedContent(
-                    targetState = showLyrics,
+                    targetState = activePanel,
                     transitionSpec = {
                         fadeIn() togetherWith fadeOut()
                     },
                     label = "lyrics_transition"
-                ) { lyricsVisible ->
-                    if (lyricsVisible) {
+                ) { panelMode ->
+                    if (panelMode == "Lyrics") {
                         LyricsView(
                             lyrics = uiState.lyrics,
                             isLoading = uiState.isLoadingLyrics,
@@ -318,7 +359,6 @@ fun PlayerScreen(
                                 )
                             }
                         } else {
-                            // Album Art
                             AsyncImage(
                                 model = artworkUrl,
                                 contentDescription = "Album Art",
@@ -332,16 +372,13 @@ fun PlayerScreen(
                     }
                 }
             }
-            
-            // Song Info
-            Surface(
+
+            PremiumGlassSurface(
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(horizontal = 20.dp, vertical = 12.dp),
-                shape = RoundedCornerShape(0.dp),
-                color = Color.Transparent,
-                tonalElevation = 0.dp,
-                shadowElevation = 0.dp
+                shape = RoundedCornerShape(24.dp),
+                tonalElevation = 4.dp
             ) {
                 Column(
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 14.dp)
@@ -450,15 +487,13 @@ fun PlayerScreen(
                     }
                 }
             }
-            
-            // Progress Bar
-            Surface(
+
+            PremiumGlassSurface(
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(horizontal = 20.dp),
-                shape = RoundedCornerShape(0.dp),
-                color = Color.Transparent,
-                tonalElevation = 0.dp
+                shape = RoundedCornerShape(24.dp),
+                tonalElevation = 3.dp
             ) {
                 Column(
                     modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)
@@ -492,15 +527,13 @@ fun PlayerScreen(
                     }
                 }
             }
-            
-            // Playback Controls
-            Surface(
+
+            PremiumGlassSurface(
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(horizontal = 20.dp, vertical = 18.dp),
-                shape = RoundedCornerShape(0.dp),
-                color = Color.Transparent,
-                tonalElevation = 0.dp
+                shape = RoundedCornerShape(24.dp),
+                tonalElevation = 4.dp
             ) {
                 Row(
                     modifier = Modifier
@@ -576,16 +609,14 @@ fun PlayerScreen(
                     }
                 }
             }
-            
-            // Bottom Actions
-            Surface(
+
+            PremiumGlassSurface(
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(horizontal = 20.dp, vertical = 8.dp)
                     .navigationBarsPadding(),
-                shape = RoundedCornerShape(0.dp),
-                color = Color.Transparent,
-                tonalElevation = 0.dp
+                shape = RoundedCornerShape(24.dp),
+                tonalElevation = 4.dp
             ) {
                 Row(
                     modifier = Modifier
@@ -593,11 +624,15 @@ fun PlayerScreen(
                         .padding(horizontal = 10.dp, vertical = 6.dp),
                     horizontalArrangement = Arrangement.SpaceEvenly
                 ) {
-                    IconButton(onClick = { showLyrics = !showLyrics }) {
+                    IconButton(
+                        onClick = {
+                            activePanel = if (activePanel == "Lyrics") "Visual" else "Lyrics"
+                        }
+                    ) {
                         Icon(
                             imageVector = Icons.Default.Lyrics,
                             contentDescription = "Lyrics",
-                            tint = if (showLyrics) accentColor else mutedForegroundColor
+                            tint = if (activePanel == "Lyrics") accentColor else mutedForegroundColor
                         )
                     }
 
@@ -684,7 +719,12 @@ fun PlayerScreen(
     // Queue Bottom Sheet
     if (showQueue) {
         ModalBottomSheet(
-            onDismissRequest = { showQueue = false },
+            onDismissRequest = {
+                showQueue = false
+                if (activePanel == "Queue") {
+                    activePanel = "Visual"
+                }
+            },
             sheetState = sheetState
         ) {
             QueueView(

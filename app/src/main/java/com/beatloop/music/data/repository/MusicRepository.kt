@@ -16,6 +16,7 @@ import com.beatloop.music.data.database.SyncDao
 import com.beatloop.music.data.model.*
 import com.beatloop.music.data.preferences.PreferencesManager
 import com.beatloop.music.domain.recommendation.RecommendationCandidate
+import com.beatloop.music.domain.recommendation.RecommendationContentRules
 import com.beatloop.music.domain.recommendation.RecommendationSource
 import com.google.gson.Gson
 import com.google.gson.JsonArray
@@ -67,7 +68,14 @@ class MusicRepository @Inject constructor(
         val timestampMs: Long
     )
 
+    private data class GenreSectionsCache(
+        val key: String,
+        val sections: List<GenreRecommendationSection>,
+        val timestampMs: Long
+    )
+
     private var onboardingSeedCache: OnboardingSeedCache? = null
+    private var genreSectionsCache: GenreSectionsCache? = null
 
     private val pipedApiInstances = listOf(
         "https://pipedapi.kavin.rocks",
@@ -360,7 +368,22 @@ class MusicRepository @Inject constructor(
             val recentSongs = songDao.getRecentlyPlayedSongItems(limit = 30)
             val topArtistStats = songDao.getTopArtistPlayStats(limit = 30)
             val preferenceProfile = getPreferenceProfile()
+            val activeLanguages = preferenceProfile.activeLanguages
             val onboardingSeedSongs = getOnboardingSeedSongs(preferenceProfile)
+
+            val filteredQuickPicks = applyLanguageFilter(filterEligibleSongs(base.quickPicks), activeLanguages)
+            val filteredTrendingSongs = applyLanguageFilter(filterEligibleSongs(base.trendingSongs), activeLanguages)
+            val filteredRecentSongs = applyLanguageFilter(
+                filterEligibleSongs(recentSongs),
+                activeLanguages,
+                allowUnknownLanguage = true
+            )
+            val filteredSeedSongs = applyLanguageFilter(
+                filterEligibleSongs(seedSongs.map { it.toSongItem() }),
+                activeLanguages,
+                allowUnknownLanguage = true
+            )
+            val filteredOnboardingSongs = applyLanguageFilter(filterEligibleSongs(onboardingSeedSongs), activeLanguages)
 
             val topArtists = buildTopArtists(seedSongs, topArtistStats)
             val weightedArtists: List<String> = (topArtists + preferenceProfile.singers)
@@ -371,35 +394,35 @@ class MusicRepository @Inject constructor(
                 .toMap()
 
             val recommendationCandidates = (
-                base.quickPicks.map {
+                filteredQuickPicks.map {
                     RecommendationCandidate(
                         song = it,
                         source = RecommendationSource.QUICK_PICK,
                         sourceBoost = 12.0
                     )
                 } +
-                    base.trendingSongs.map {
+                    filteredTrendingSongs.map {
                         RecommendationCandidate(
                             song = it,
                             source = RecommendationSource.TRENDING,
                             sourceBoost = 7.0
                         )
                     } +
-                    recentSongs.map {
+                    filteredRecentSongs.map {
                         RecommendationCandidate(
                             song = it,
                             source = RecommendationSource.RECENT,
                             sourceBoost = 3.0
                         )
                     } +
-                    seedSongs.map {
+                    filteredSeedSongs.map {
                         RecommendationCandidate(
-                            song = it.toSongItem(),
+                            song = it,
                             source = RecommendationSource.PERSONALIZATION_SEED,
                             sourceBoost = 8.0
                         )
                     } +
-                    onboardingSeedSongs.map {
+                    filteredOnboardingSongs.map {
                         RecommendationCandidate(
                             song = it,
                             source = RecommendationSource.ONBOARDING,
@@ -418,32 +441,32 @@ class MusicRepository @Inject constructor(
                 )
 
             val motivationMessage = when {
-                onboardingSeedSongs.isNotEmpty() && preferenceProfile.singers.isNotEmpty() ->
+                filteredOnboardingSongs.isNotEmpty() && preferenceProfile.singers.isNotEmpty() ->
                     "Recommendations tuned for ${preferenceProfile.singers.first()} and your selected vibe"
                 personalized.isNotEmpty() && weightedArtists.isNotEmpty() ->
                     "Fresh picks based on your ${weightedArtists.first()} listening taste"
-                recentSongs.isNotEmpty() -> "Welcome back. Your recent vibe is ready."
-                preferenceProfile.languages.isNotEmpty() ->
-                    "Handpicked recommendations for ${preferenceProfile.languages.take(2).joinToString(", ")}"
+                filteredRecentSongs.isNotEmpty() -> "Welcome back. Your recent vibe is ready."
+                activeLanguages.isNotEmpty() ->
+                    "Handpicked recommendations for ${activeLanguages.take(2).joinToString(", ")}" 
                 else -> "Start listening to unlock a personalized feed."
             }
 
             val personalizedPool = personalized.ifEmpty {
-                onboardingSeedSongs.take(30).ifEmpty { base.trendingSongs.take(30) }
+                filteredOnboardingSongs.take(30).ifEmpty { filteredTrendingSongs.take(30) }
             }
 
             val diversifiedPool = diversifyRecommendations(
                 candidates = personalizedPool,
-                recentlyPlayedIds = recentSongs.map { it.id }.toSet(),
+                recentlyPlayedIds = filteredRecentSongs.map { it.id }.toSet(),
                 refreshNonce = refreshNonce
             )
 
-            val fallbackQuickPicks = (onboardingSeedSongs + base.quickPicks)
+            val fallbackQuickPicks = (filteredOnboardingSongs + filteredQuickPicks)
                 .distinctBy { it.id }
                 .take(15)
 
             val finalQuickPicks = diversifiedPool.take(15)
-                .ifEmpty { fallbackQuickPicks.ifEmpty { base.quickPicks } }
+                .ifEmpty { fallbackQuickPicks.ifEmpty { filteredQuickPicks } }
 
             val finalQuickPickIds = finalQuickPicks.map { it.id }.toSet()
 
@@ -461,12 +484,18 @@ class MusicRepository @Inject constructor(
                 )
             }
 
+            val genreSections = buildGenreSections(preferenceProfile)
+
             base.copy(
                 motivationMessage = motivationMessage,
                 quickPicks = finalQuickPicks,
                 personalizedRecommendations = finalPersonalized,
-                recentlyPlayed = recentSongs.ifEmpty { base.recentlyPlayed },
-                topArtists = weightedArtists.take(5).ifEmpty { preferenceProfile.singers.take(5) }
+                recentlyPlayed = filteredRecentSongs.ifEmpty {
+                    applyLanguageFilter(filterEligibleSongs(base.recentlyPlayed), activeLanguages, allowUnknownLanguage = true)
+                },
+                trendingSongs = filteredTrendingSongs,
+                topArtists = weightedArtists.take(5).ifEmpty { preferenceProfile.singers.take(5) },
+                genreSections = genreSections
             )
         } catch (e: Exception) {
             Log.w(TAG, "Failed to personalize home content: ${e.message}")
@@ -476,12 +505,26 @@ class MusicRepository @Inject constructor(
 
     private suspend fun getPreferenceProfile(): PreferenceProfile {
         val onboardingCompleted = preferencesManager.onboardingCompleted.first()
+        val contentLanguage = RecommendationContentRules.normalizeLanguage(preferencesManager.contentLanguage.first())
+        val preferredLanguages = RecommendationContentRules.normalizeLanguages(
+            preferencesManager.preferredLanguages.first().filterNot { it.equals("None", ignoreCase = true) }
+        )
+        val activeLanguages = if (preferredLanguages.isNotEmpty()) {
+            preferredLanguages
+        } else {
+            contentLanguage?.let { setOf(it) }.orEmpty()
+        }
+
         if (!onboardingCompleted) {
-            return PreferenceProfile()
+            return PreferenceProfile(
+                primaryLanguage = contentLanguage,
+                activeLanguages = activeLanguages
+            )
         }
 
         return PreferenceProfile(
-            languages = preferencesManager.preferredLanguages.first().filterNot { it.equals("None", ignoreCase = true) }.toSet(),
+            primaryLanguage = contentLanguage,
+            activeLanguages = activeLanguages,
             singers = preferencesManager.preferredSingers.first().filterNot { it.equals("None", ignoreCase = true) }.toSet(),
             lyricists = preferencesManager.preferredLyricists.first().filterNot { it.equals("None", ignoreCase = true) }.toSet(),
             musicDirectors = preferencesManager.preferredMusicDirectors.first().filterNot { it.equals("None", ignoreCase = true) }.toSet()
@@ -489,14 +532,15 @@ class MusicRepository @Inject constructor(
     }
 
     private data class PreferenceProfile(
-        val languages: Set<String> = emptySet(),
+        val primaryLanguage: String? = null,
+        val activeLanguages: Set<String> = emptySet(),
         val singers: Set<String> = emptySet(),
         val lyricists: Set<String> = emptySet(),
         val musicDirectors: Set<String> = emptySet()
     )
 
     private fun PreferenceProfile.hasSelections(): Boolean {
-        return languages.isNotEmpty() ||
+        return activeLanguages.isNotEmpty() ||
             singers.isNotEmpty() ||
             lyricists.isNotEmpty() ||
             musicDirectors.isNotEmpty()
@@ -506,7 +550,7 @@ class MusicRepository @Inject constructor(
         if (!preferenceProfile.hasSelections()) return emptyList()
 
         val key = buildString {
-            append(preferenceProfile.languages.sorted().joinToString(","))
+            append(preferenceProfile.activeLanguages.sorted().joinToString(","))
             append("|")
             append(preferenceProfile.singers.sorted().joinToString(","))
             append("|")
@@ -529,7 +573,10 @@ class MusicRepository @Inject constructor(
             queries
                 .map { query ->
                     async {
-                        fetchSeedSongsForQuery(query)
+                        fetchSeedSongsForQuery(
+                            query = query,
+                            preferredLanguages = preferenceProfile.activeLanguages
+                        )
                     }
                 }
                 .awaitAll()
@@ -547,7 +594,7 @@ class MusicRepository @Inject constructor(
             .take(5)
             .flatMap { singer -> listOf("$singer hits", "$singer songs") }
 
-        val languageQueries = preferenceProfile.languages
+        val languageQueries = preferenceProfile.activeLanguages
             .take(3)
             .flatMap { language ->
                 languageSearchHints[language.lowercase()] ?: listOf("$language songs")
@@ -568,18 +615,189 @@ class MusicRepository @Inject constructor(
             .take(8)
     }
 
-    private suspend fun fetchSeedSongsForQuery(query: String): List<SongItem> {
+    private suspend fun fetchSeedSongsForQuery(
+        query: String,
+        preferredLanguages: Set<String> = emptySet(),
+        maxItems: Int = 12
+    ): List<SongItem> {
         return try {
             val body = JsonObject().apply {
                 addProperty("query", query)
                 add("context", createWebContext())
             }
             val response = innerTubeApi.search(body)
-            parseSearchResult(response, SearchFilter.Songs).songs.take(12)
+            applyLanguageFilter(
+                songs = filterEligibleSongs(parseSearchResult(response, SearchFilter.Songs).songs),
+                activeLanguages = preferredLanguages,
+                allowUnknownLanguage = true
+            ).take(maxItems)
         } catch (e: Exception) {
             Log.w(TAG, "Seed query failed ($query): ${e.message}")
             emptyList()
         }
+    }
+
+    private suspend fun buildGenreSections(preferenceProfile: PreferenceProfile): List<GenreRecommendationSection> {
+        val activeLanguages = preferenceProfile.activeLanguages
+        val primaryLanguage = preferenceProfile.primaryLanguage ?: activeLanguages.firstOrNull()
+
+        val cacheKey = buildString {
+            append(primaryLanguage?.lowercase().orEmpty())
+            append("|")
+            append(activeLanguages.sorted().joinToString(","))
+        }
+
+        val now = System.currentTimeMillis()
+        genreSectionsCache?.let { cache ->
+            if (cache.key == cacheKey && (now - cache.timestampMs) <= 15 * 60 * 1000L) {
+                return cache.sections
+            }
+        }
+
+        val sectionQueries = listOf(
+            "Trending" to "trending songs",
+            "Melodies" to "melody songs",
+            "Hits" to "hit songs",
+            "Romantic Songs" to "romantic songs",
+            "Love Songs" to "love songs",
+            "DJ Songs" to "dj songs"
+        )
+
+        val sections = coroutineScope {
+            sectionQueries.map { (title, queryTail) ->
+                async {
+                    val query = buildGenreQuery(primaryLanguage, queryTail)
+                    val songs = fetchSeedSongsForQuery(
+                        query = query,
+                        preferredLanguages = activeLanguages,
+                        maxItems = 16
+                    )
+                    if (songs.isEmpty()) {
+                        null
+                    } else {
+                        GenreRecommendationSection(
+                            title = title,
+                            songs = songs.distinctBy { it.id }
+                        )
+                    }
+                }
+            }.awaitAll().filterNotNull()
+        }
+
+        genreSectionsCache = GenreSectionsCache(key = cacheKey, sections = sections, timestampMs = now)
+        return sections
+    }
+
+    private fun buildGenreQuery(primaryLanguage: String?, queryTail: String): String {
+        if (primaryLanguage.isNullOrBlank()) return queryTail
+        return "${primaryLanguage.lowercase()} $queryTail"
+    }
+
+    private fun filterEligibleSongs(songs: List<SongItem>): List<SongItem> {
+        return songs
+            .asSequence()
+            .filter { song -> song.id.isNotBlank() && RecommendationContentRules.isTrackAllowed(song) }
+            .distinctBy { song -> song.id }
+            .toList()
+    }
+
+    private fun applyLanguageFilter(
+        songs: List<SongItem>,
+        activeLanguages: Set<String>,
+        allowUnknownLanguage: Boolean = false
+    ): List<SongItem> {
+        if (songs.isEmpty()) return emptyList()
+        if (activeLanguages.isEmpty()) return songs.distinctBy { it.id }
+
+        return songs
+            .asSequence()
+            .filter { song ->
+                RecommendationContentRules.matchesAllowedLanguages(
+                    song = song,
+                    allowedLanguages = activeLanguages,
+                    allowUnknownLanguage = allowUnknownLanguage
+                )
+            }
+            .distinctBy { song -> song.id }
+            .toList()
+    }
+
+    private fun createSongItemIfEligible(
+        id: String,
+        title: String,
+        artistsText: String = "",
+        artistId: String? = null,
+        thumbnailUrl: String? = null,
+        albumId: String? = null,
+        durationMs: Long? = null,
+        localPath: String? = null
+    ): SongItem? {
+        val song = SongItem(
+            id = id,
+            title = title,
+            artistsText = artistsText,
+            artistId = artistId,
+            thumbnailUrl = thumbnailUrl,
+            albumId = albumId,
+            duration = durationMs?.takeIf { it > 0L },
+            localPath = localPath
+        )
+
+        return if (RecommendationContentRules.isTrackAllowed(song)) song else null
+    }
+
+    private fun parseDurationMs(rawText: String?): Long? {
+        val text = rawText?.lowercase()?.trim().orEmpty()
+        if (text.isBlank()) return null
+
+        val hmsToken = Regex("(?<!\\d)(?:\\d{1,2}:)?\\d{1,2}:\\d{2}(?!\\d)")
+            .find(text)
+            ?.value
+
+        if (!hmsToken.isNullOrBlank()) {
+            val parts = hmsToken.split(":").mapNotNull { token -> token.toLongOrNull() }
+            val seconds = when (parts.size) {
+                2 -> parts[0] * 60L + parts[1]
+                3 -> parts[0] * 3600L + parts[1] * 60L + parts[2]
+                else -> null
+            }
+            if (seconds != null) return seconds * 1000L
+        }
+
+        val minuteValue = Regex("(?<!\\d)(\\d{1,3})\\s*(min|mins|minute|minutes)\\b")
+            .find(text)
+            ?.groupValues
+            ?.getOrNull(1)
+            ?.toLongOrNull()
+
+        if (minuteValue != null) {
+            return minuteValue * 60L * 1000L
+        }
+
+        val hourValue = Regex("(?<!\\d)(\\d{1,2})\\s*(hr|hrs|hour|hours)\\b")
+            .find(text)
+            ?.groupValues
+            ?.getOrNull(1)
+            ?.toLongOrNull()
+
+        if (hourValue != null) {
+            return hourValue * 60L * 60L * 1000L
+        }
+
+        return null
+    }
+
+    private fun parseDurationFromFixedColumns(fixedColumns: JsonArray?): Long? {
+        val durationText = fixedColumns
+            ?.firstOrNull()?.asJsonObject
+            ?.getAsJsonObject("musicResponsiveListItemFixedColumnRenderer")
+            ?.getAsJsonObject("text")
+            ?.getAsJsonArray("runs")
+            ?.joinToString(separator = "") { run ->
+                run.asJsonObject?.get("text")?.asString.orEmpty()
+            }
+
+        return parseDurationMs(durationText)
     }
 
     private fun buildTopArtists(seedSongs: List<Song>, stats: List<ArtistPlayStat>): List<String> {
@@ -1814,6 +2032,7 @@ class MusicRepository @Inject constructor(
             
             if (watchEndpoint != null) {
                 val videoId = watchEndpoint.get("videoId")?.asString ?: return null
+                val durationMs = parseDurationFromFixedColumns(fixedColumns)
                 
                 val artistsText = if (flexColumns.size() > 1) {
                     flexColumns[1].asJsonObject
@@ -1830,12 +2049,13 @@ class MusicRepository @Inject constructor(
                     ?.getAsJsonArray("thumbnails")
                     ?.lastOrNull()?.asJsonObject
                     ?.get("url")?.asString
-                
-                SongItem(
+
+                createSongItemIfEligible(
                     id = videoId,
                     title = title,
                     artistsText = artistsText,
-                    thumbnailUrl = thumbnailUrl
+                    thumbnailUrl = thumbnailUrl,
+                    durationMs = durationMs
                 )
             } else if (browseEndpoint != null) {
                 val browseId = browseEndpoint.get("browseId")?.asString ?: return null
@@ -2003,80 +2223,81 @@ class MusicRepository @Inject constructor(
                         ?.lastOrNull()?.asJsonObject
                         ?.get("url")?.asString
                     
-                    val song = SongItem(
+                    val song = createSongItemIfEligible(
                         id = videoId,
                         title = title,
                         artistsText = artistText,
-                        thumbnailUrl = thumbnailUrl
+                        thumbnailUrl = thumbnailUrl,
+                        durationMs = parseDurationMs(artistText)
                     )
                     
                     // Add to quick picks or trending based on shelf title or size
-                    if (shelfTitle.contains("quick") || shelfTitle.contains("listen again") || quickPicks.size < 15) {
-                        if (quickPicks.none { it.id == videoId }) quickPicks.add(song)
-                    } else {
-                        if (trendingSongs.none { it.id == videoId }) trendingSongs.add(song)
+                    if (song != null) {
+                        if (shelfTitle.contains("quick") || shelfTitle.contains("listen again") || quickPicks.size < 15) {
+                            if (quickPicks.none { it.id == videoId }) quickPicks.add(song)
+                        } else {
+                            if (trendingSongs.none { it.id == videoId }) trendingSongs.add(song)
+                        }
                     }
                 }
             }
             
-            twoRowItem?.let twoRowScope@ { twoRow ->
+            if (twoRowItem != null) {
+                val twoRow = twoRowItem
                 val title = twoRow.getAsJsonObject("title")
                     ?.getAsJsonArray("runs")
                     ?.firstOrNull()?.asJsonObject
-                    ?.get("text")?.asString ?: return@twoRowScope
-                
+                    ?.get("text")?.asString ?: return@forEach
+
                 val navigationEndpoint = twoRow.getAsJsonObject("navigationEndpoint")
                 val watchEndpoint = navigationEndpoint?.getAsJsonObject("watchEndpoint")
                 val browseEndpoint = navigationEndpoint?.getAsJsonObject("browseEndpoint")
-                
+
                 val thumbnailUrl = twoRow.getAsJsonObject("thumbnailRenderer")
                     ?.getAsJsonObject("musicThumbnailRenderer")
                     ?.getAsJsonObject("thumbnail")
                     ?.getAsJsonArray("thumbnails")
                     ?.lastOrNull()?.asJsonObject
                     ?.get("url")?.asString
-                
+
                 if (watchEndpoint != null) {
-                    val videoId = watchEndpoint.get("videoId")?.asString ?: return@twoRowScope
+                    val videoId = watchEndpoint.get("videoId")?.asString ?: return@forEach
                     val subtitle = twoRow.getAsJsonObject("subtitle")
                         ?.getAsJsonArray("runs")
                         ?.firstOrNull()?.asJsonObject
                         ?.get("text")?.asString ?: ""
-                    
-                    val song = SongItem(
+
+                    val song = createSongItemIfEligible(
                         id = videoId,
                         title = title,
                         artistsText = subtitle,
-                        thumbnailUrl = thumbnailUrl
+                        thumbnailUrl = thumbnailUrl,
+                        durationMs = parseDurationMs(subtitle)
                     )
-                    
-                    if (shelfTitle.contains("trending") || shelfTitle.contains("charts")) {
-                        if (trendingSongs.none { it.id == videoId }) trendingSongs.add(song)
-                    } else if (quickPicks.size < 20) {
-                        if (quickPicks.none { it.id == videoId }) quickPicks.add(song)
-                    } else {
-                        if (trendingSongs.none { it.id == videoId }) trendingSongs.add(song)
+
+                    if (song != null) {
+                        if (shelfTitle.contains("trending") || shelfTitle.contains("charts")) {
+                            if (trendingSongs.none { it.id == videoId }) trendingSongs.add(song)
+                        } else if (quickPicks.size < 20) {
+                            if (quickPicks.none { it.id == videoId }) quickPicks.add(song)
+                        } else {
+                            if (trendingSongs.none { it.id == videoId }) trendingSongs.add(song)
+                        }
                     }
-                    
+
                 } else if (browseEndpoint != null) {
-                    val browseId = browseEndpoint.get("browseId")?.asString ?: return@twoRowScope
+                    val browseId = browseEndpoint.get("browseId")?.asString ?: return@forEach
                     val pageType = browseEndpoint.getAsJsonObject("browseEndpointContextSupportedConfigs")
                         ?.getAsJsonObject("browseEndpointContextMusicConfig")
                         ?.get("pageType")?.asString
-                    
-                    val subtitleRuns = twoRow.getAsJsonObject("subtitle")?.getAsJsonArray("runs")
-                    val subtitleBuilder = StringBuilder()
-                    subtitleRuns?.forEach { run ->
-                        subtitleBuilder.append(run.asJsonObject?.get("text")?.asString ?: "")
-                    }
-                    val subtitle = subtitleBuilder.toString()
-                    
+
                     when (pageType) {
                         "MUSIC_PAGE_TYPE_ALBUM" -> {
                             if (newReleases.none { it.id == browseId }) {
                                 newReleases.add(AlbumItem(browseId, title, thumbnailUrl = thumbnailUrl))
                             }
                         }
+
                         "MUSIC_PAGE_TYPE_PLAYLIST" -> {
                             if (recommendedPlaylists.none { it.id == browseId }) {
                                 recommendedPlaylists.add(PlaylistItem(browseId, title, thumbnailUrl = thumbnailUrl))
@@ -2339,14 +2560,15 @@ class MusicRepository @Inject constructor(
                         ?.filter { it != " • " && it != " & " }
                         ?.joinToString(", ") ?: artistName
                 } else artistName
-                
-                songs.add(SongItem(
+
+                createSongItemIfEligible(
                     id = videoId,
                     title = songTitle,
                     artistsText = songArtist.ifEmpty { artistName },
                     albumId = albumId,
-                    thumbnailUrl = thumbnailUrl
-                ))
+                    thumbnailUrl = thumbnailUrl,
+                    durationMs = parseDurationMs(songArtist)
+                )?.let { songs.add(it) }
             }
             
             Log.d(TAG, "Parsed ${songs.size} songs from album $albumTitle")
@@ -2458,13 +2680,14 @@ class MusicRepository @Inject constructor(
                     ?.getAsJsonArray("thumbnails")
                     ?.lastOrNull()?.asJsonObject
                     ?.get("url")?.asString
-                
-                songs.add(SongItem(
+
+                createSongItemIfEligible(
                     id = videoId,
                     title = songTitle,
                     artistsText = artistText,
-                    thumbnailUrl = songThumbnail
-                ))
+                    thumbnailUrl = songThumbnail,
+                    durationMs = parseDurationMs(artistText)
+                )?.let { songs.add(it) }
             }
             
             continuation = contents?.getAsJsonArray("continuations")
@@ -2879,13 +3102,21 @@ class MusicRepository @Inject constructor(
                     ?.getAsJsonArray("thumbnails")
                     ?.lastOrNull()?.asJsonObject
                     ?.get("url")?.asString
-                
-                songs.add(SongItem(
+
+                val lengthText = itemObj.getAsJsonObject("lengthText")
+                    ?.getAsJsonArray("runs")
+                    ?.firstOrNull()?.asJsonObject
+                    ?.get("text")?.asString
+                    ?: itemObj.getAsJsonObject("lengthText")
+                        ?.get("simpleText")?.asString
+
+                createSongItemIfEligible(
                     id = videoId,
                     title = title,
                     artistsText = artistText,
-                    thumbnailUrl = thumbnailUrl
-                ))
+                    thumbnailUrl = thumbnailUrl,
+                    durationMs = parseDurationMs(lengthText ?: title)
+                )?.let { songs.add(it) }
             }
         } catch (e: Exception) {
             e.printStackTrace()

@@ -3,8 +3,15 @@ package com.beatloop.music.ui.screens
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
-import androidx.compose.foundation.background
-import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
@@ -13,13 +20,27 @@ import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.SignalWifiOff
 import androidx.compose.material.icons.filled.Wifi
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
+import androidx.compose.foundation.layout.width
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilledTonalIconButton
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.TopAppBarDefaults
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
-import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -31,7 +52,22 @@ import androidx.navigation.NavController
 import com.beatloop.music.data.model.SongItem
 import com.beatloop.music.playback.createMediaItem
 import com.beatloop.music.ui.LocalPlayerConnection
-import com.beatloop.music.ui.components.*
+import com.beatloop.music.ui.PlayerConnection
+import com.beatloop.music.ui.components.AddToPlaylistBottomSheet
+import com.beatloop.music.ui.components.AlbumCard
+import com.beatloop.music.ui.components.PlaylistCard
+import com.beatloop.music.ui.components.PremiumEmptyState
+import com.beatloop.music.ui.components.PremiumErrorState
+import com.beatloop.music.ui.components.PremiumHeroCard
+import com.beatloop.music.ui.components.PremiumOfflineBanner
+import com.beatloop.music.ui.components.PremiumScreenBackground
+import com.beatloop.music.ui.components.PremiumSectionHeader
+import com.beatloop.music.ui.components.PremiumSkeletonCard
+import com.beatloop.music.ui.components.PremiumSkeletonHero
+import com.beatloop.music.ui.components.PremiumSkeletonListItem
+import com.beatloop.music.ui.components.SongCard
+import com.beatloop.music.ui.components.SongListItem
+import com.beatloop.music.ui.components.SongOptionsBottomSheet
 import com.beatloop.music.ui.navigation.Screen
 import com.beatloop.music.ui.viewmodel.HomeViewModel
 import com.beatloop.music.ui.viewmodel.SongActionsViewModel
@@ -47,13 +83,12 @@ fun HomeScreen(
     val uiState by viewModel.uiState.collectAsState()
     val playerConnection = LocalPlayerConnection.current
     val context = LocalContext.current
-    
-    // Song options state
+
     var selectedSong by remember { mutableStateOf<SongItem?>(null) }
     var showSongOptions by remember { mutableStateOf(false) }
     var showAddToPlaylist by remember { mutableStateOf(false) }
     var showCreatePlaylist by remember { mutableStateOf(false) }
-    
+
     val playlists by songActionsViewModel.playlists.collectAsState()
     val likedSongIds by songActionsViewModel.likedSongIds.collectAsState()
     val downloadedSongIds by songActionsViewModel.downloadedSongIds.collectAsState()
@@ -72,8 +107,7 @@ fun HomeScreen(
             lifecycleOwner.lifecycle.removeObserver(observer)
         }
     }
-    
-    // Song Options Bottom Sheet
+
     if (showSongOptions && selectedSong != null) {
         SongOptionsBottomSheet(
             song = selectedSong!!,
@@ -134,8 +168,7 @@ fun HomeScreen(
             }
         )
     }
-    
-    // Add to Playlist Bottom Sheet
+
     if (showAddToPlaylist && selectedSong != null) {
         AddToPlaylistBottomSheet(
             playlists = playlists,
@@ -149,8 +182,7 @@ fun HomeScreen(
             }
         )
     }
-    
-    // Create Playlist Dialog
+
     if (showCreatePlaylist && selectedSong != null) {
         var playlistName by remember { mutableStateOf("") }
         AlertDialog(
@@ -168,7 +200,11 @@ fun HomeScreen(
                 TextButton(
                     onClick = {
                         if (playlistName.isNotBlank()) {
-                            songActionsViewModel.createPlaylistAndAddSong(playlistName, selectedSong!!, context)
+                            songActionsViewModel.createPlaylistAndAddSong(
+                                playlistName,
+                                selectedSong!!,
+                                context
+                            )
                             showCreatePlaylist = false
                         }
                     },
@@ -184,22 +220,22 @@ fun HomeScreen(
             }
         )
     }
-    
+
     Scaffold(
+        containerColor = androidx.compose.ui.graphics.Color.Transparent,
         topBar = {
             Column {
-                // Network status banner
                 AnimatedVisibility(
                     visible = uiState.showNetworkMessage,
                     enter = slideInVertically(),
                     exit = slideOutVertically()
                 ) {
-                    NetworkStatusBanner(
+                    HomeNetworkBanner(
                         networkStatus = uiState.networkStatus,
                         wasOffline = uiState.wasOffline
                     )
                 }
-                
+
                 TopAppBar(
                     title = {
                         Column {
@@ -209,229 +245,195 @@ fun HomeScreen(
                                 fontWeight = FontWeight.Bold
                             )
                             Text(
-                                text = "Fresh picks tuned to your listening",
+                                text = "Editorial mixes shaped by your sessions",
                                 style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.72f)
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                         }
                     },
                     actions = {
                         FilledTonalIconButton(onClick = { viewModel.loadHome(forceRefresh = true) }) {
-                            Icon(
+                            androidx.compose.material3.Icon(
                                 imageVector = Icons.Default.Refresh,
                                 contentDescription = "Refresh recommendations"
                             )
                         }
                         Spacer(modifier = Modifier.width(8.dp))
                         FilledTonalIconButton(onClick = { navController.navigate(Screen.Settings.route) }) {
-                            Icon(
+                            androidx.compose.material3.Icon(
                                 imageVector = Icons.Default.Settings,
                                 contentDescription = "Settings"
                             )
                         }
                     },
                     colors = TopAppBarDefaults.topAppBarColors(
-                        containerColor = Color.Transparent
+                        containerColor = androidx.compose.ui.graphics.Color.Transparent
                     )
                 )
             }
         }
     ) { padding ->
-        Box(
+        PremiumScreenBackground(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(padding)
-                .background(
-                    brush = Brush.verticalGradient(
-                        colors = listOf(
-                            MaterialTheme.colorScheme.primary.copy(alpha = 0.16f),
-                            MaterialTheme.colorScheme.tertiary.copy(alpha = 0.06f),
-                            MaterialTheme.colorScheme.background
-                        )
-                    )
-                )
         ) {
             when {
                 uiState.isLoading -> {
-                    Column(
-                        modifier = Modifier.align(Alignment.Center),
-                        horizontalAlignment = Alignment.CenterHorizontally
-                    ) {
-                        CircularProgressIndicator()
-                        Spacer(modifier = Modifier.height(14.dp))
-                        Text(
-                            text = "Collecting your next wave of tracks...",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.78f)
-                        )
-                    }
+                    HomeLoadingState()
                 }
+
                 uiState.error != null -> {
-                    Surface(
-                        modifier = Modifier
-                            .align(Alignment.Center)
-                            .padding(16.dp),
-                        shape = RoundedCornerShape(24.dp),
-                        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.76f),
-                        tonalElevation = 2.dp
-                    ) {
-                        Column(
-                            modifier = Modifier.padding(horizontal = 20.dp, vertical = 24.dp),
-                            horizontalAlignment = Alignment.CenterHorizontally
-                        ) {
-                            if (uiState.networkStatus == NetworkStatus.Unavailable ||
-                                uiState.networkStatus == NetworkStatus.Lost) {
-                                Icon(
-                                    imageVector = Icons.Default.SignalWifiOff,
-                                    contentDescription = null,
-                                    modifier = Modifier.size(58.dp),
-                                    tint = MaterialTheme.colorScheme.error
-                                )
-                                Spacer(modifier = Modifier.height(14.dp))
-                            }
-                            Text(
-                                text = uiState.error ?: "An error occurred",
-                                style = MaterialTheme.typography.titleMedium,
-                                color = MaterialTheme.colorScheme.error
-                            )
-                            Spacer(modifier = Modifier.height(16.dp))
-                            FilledTonalButton(onClick = { viewModel.loadHome(forceRefresh = true) }) {
-                                Text("Try Again")
-                            }
-                        }
-                    }
+                    PremiumErrorState(
+                        message = uiState.error ?: "Unable to load your feed.",
+                        onRetry = { viewModel.loadHome(forceRefresh = true) }
+                    )
                 }
-                uiState.quickPicks.isEmpty() && uiState.personalizedRecommendations.isEmpty() &&
-                uiState.recentlyPlayed.isEmpty() && uiState.trendingSongs.isEmpty() &&
-                uiState.newReleases.isEmpty() && uiState.recommendedPlaylists.isEmpty() -> {
-                    Surface(
-                        modifier = Modifier
-                            .align(Alignment.Center)
-                            .padding(16.dp),
-                        shape = RoundedCornerShape(24.dp),
-                        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.76f),
-                        tonalElevation = 2.dp
-                    ) {
-                        Column(
-                            modifier = Modifier.padding(horizontal = 20.dp, vertical = 24.dp),
-                            horizontalAlignment = Alignment.CenterHorizontally
-                        ) {
-                            Text(
-                                text = "No content available",
-                                style = MaterialTheme.typography.titleMedium
-                            )
-                            Spacer(modifier = Modifier.height(8.dp))
-                            Text(
-                                text = "Refresh and we will fetch a new mix for you",
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                            Spacer(modifier = Modifier.height(16.dp))
-                            FilledTonalButton(onClick = { viewModel.loadHome(forceRefresh = true) }) {
-                                Text("Refresh")
-                            }
-                        }
-                    }
+
+                uiState.quickPicks.isEmpty() &&
+                    uiState.personalizedRecommendations.isEmpty() &&
+                    uiState.recentlyPlayed.isEmpty() &&
+                    uiState.trendingSongs.isEmpty() &&
+                    uiState.genreSections.isEmpty() &&
+                    uiState.newReleases.isEmpty() &&
+                    uiState.recommendedPlaylists.isEmpty() -> {
+                    PremiumEmptyState(
+                        title = "Your home feed is quiet",
+                        message = "Refresh to pull a fresh editorial mix.",
+                        icon = Icons.Default.SignalWifiOff,
+                        actionLabel = "Refresh",
+                        onAction = { viewModel.loadHome(forceRefresh = true) }
+                    )
                 }
+
                 else -> {
+                    val continueListening = uiState.quickPicks.ifEmpty { uiState.recentlyPlayed }
+                    val becauseYouPlayed =
+                        (uiState.quickPicks + uiState.personalizedRecommendations)
+                            .distinctBy { it.id }
+                            .take(20)
+
                     LazyColumn(
                         modifier = Modifier.fillMaxSize(),
-                        contentPadding = PaddingValues(vertical = 10.dp)
+                        contentPadding = PaddingValues(bottom = 120.dp)
                     ) {
-                        if (!uiState.motivationMessage.isNullOrBlank() || uiState.topArtists.isNotEmpty()) {
+                        if (uiState.personalizedRecommendations.isNotEmpty()) {
+                            val heroSong = uiState.personalizedRecommendations.first()
                             item {
-                                Surface(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .padding(horizontal = 16.dp, vertical = 8.dp),
-                                    shape = RoundedCornerShape(22.dp),
-                                    color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.9f),
-                                    tonalElevation = 2.dp,
-                                    shadowElevation = 1.dp
-                                ) {
-                                    Column(modifier = Modifier.padding(16.dp)) {
-                                        Text(
-                                            text = uiState.motivationMessage ?: "Music picked around your taste",
-                                            style = MaterialTheme.typography.titleMedium,
-                                            fontWeight = FontWeight.Bold,
-                                            color = MaterialTheme.colorScheme.onPrimaryContainer
+                                PremiumHeroCard(
+                                    title = heroSong.title,
+                                    subtitle = "${heroSong.artistsText} • curated from your recent mood",
+                                    badge = "Made For You",
+                                    onClick = {
+                                        playSong(
+                                            song = heroSong,
+                                            allSongs = uiState.personalizedRecommendations,
+                                            playerConnection = playerConnection
                                         )
-                                        if (uiState.topArtists.isNotEmpty()) {
-                                            Spacer(modifier = Modifier.height(8.dp))
-                                            Text(
-                                                text = "Top artists: ${uiState.topArtists.joinToString(separator = " • ")}",
-                                                style = MaterialTheme.typography.bodySmall,
-                                                color = MaterialTheme.colorScheme.onPrimaryContainer
-                                            )
-                                        }
+                                    },
+                                    modifier = Modifier.padding(top = 8.dp)
+                                )
+                            }
+                        }
+
+                        if (continueListening.isNotEmpty()) {
+                            item {
+                                PremiumSectionHeader(
+                                    title = "Continue Listening",
+                                    subtitle = "Jump back in instantly"
+                                )
+                            }
+                            item {
+                                SongCarouselSection(
+                                    songs = continueListening.take(20),
+                                    onSongClick = { song ->
+                                        playSong(song, continueListening, playerConnection)
+                                    },
+                                    onSongLongClick = { song ->
+                                        selectedSong = song
+                                        showSongOptions = true
                                     }
-                                }
+                                )
                             }
                         }
 
                         if (uiState.personalizedRecommendations.isNotEmpty()) {
                             item {
-                                SectionHeader(title = "Made For You")
-                            }
-                            item {
-                                LazyRow(
-                                    contentPadding = PaddingValues(horizontal = 16.dp),
-                                    horizontalArrangement = Arrangement.spacedBy(12.dp)
-                                ) {
-                                    items(uiState.personalizedRecommendations.take(20)) { song ->
-                                        SongCard(
-                                            song = song,
-                                            onClick = {
-                                                playSong(song, uiState.personalizedRecommendations, playerConnection)
-                                            },
-                                            onLongClick = {
-                                                selectedSong = song
-                                                showSongOptions = true
-                                            }
-                                        )
-                                    }
-                                }
-                                Spacer(modifier = Modifier.height(24.dp))
-                            }
-                        }
-
-                        // Quick Picks
-                        if (uiState.quickPicks.isNotEmpty()) {
-                            item {
-                                SectionHeader(
-                                    title = "Quick Picks",
-                                    onViewAll = { /* Navigate to full list */ }
+                                PremiumSectionHeader(
+                                    title = "Made For You",
+                                    subtitle = "Fresh recommendations tuned to your profile"
                                 )
                             }
                             item {
-                                LazyRow(
-                                    contentPadding = PaddingValues(horizontal = 16.dp),
-                                    horizontalArrangement = Arrangement.spacedBy(12.dp)
-                                ) {
-                                    items(uiState.quickPicks) { song ->
-                                        SongCard(
-                                            song = song,
-                                            onClick = {
-                                                songActionsViewModel.addToPlayHistory(song)
-                                                playSong(song, uiState.quickPicks, playerConnection)
-                                            },
-                                            onLongClick = {
-                                                selectedSong = song
-                                                showSongOptions = true
-                                            }
+                                SongCarouselSection(
+                                    songs = uiState.personalizedRecommendations.take(20),
+                                    onSongClick = { song ->
+                                        playSong(
+                                            song,
+                                            uiState.personalizedRecommendations,
+                                            playerConnection
                                         )
+                                    },
+                                    onSongLongClick = { song ->
+                                        selectedSong = song
+                                        showSongOptions = true
                                     }
-                                }
-                                Spacer(modifier = Modifier.height(24.dp))
+                                )
                             }
                         }
 
-                        // Recently Played
+                        if (becauseYouPlayed.isNotEmpty()) {
+                            item {
+                                PremiumSectionHeader(
+                                    title = "Because You Played",
+                                    subtitle = "Blended from your strongest repeats"
+                                )
+                            }
+                            item {
+                                SongCarouselSection(
+                                    songs = becauseYouPlayed,
+                                    onSongClick = { song ->
+                                        playSong(song, becauseYouPlayed, playerConnection)
+                                    },
+                                    onSongLongClick = { song ->
+                                        selectedSong = song
+                                        showSongOptions = true
+                                    }
+                                )
+                            }
+                        }
+
+                        uiState.genreSections
+                            .filter { section -> section.songs.isNotEmpty() }
+                            .forEach { section ->
+                                item {
+                                    PremiumSectionHeader(
+                                        title = section.title,
+                                        subtitle = "Personalized genre picks for your current language preference"
+                                    )
+                                }
+                                item {
+                                    SongCarouselSection(
+                                        songs = section.songs.take(20),
+                                        onSongClick = { song ->
+                                            playSong(song, section.songs, playerConnection)
+                                        },
+                                        onSongLongClick = { song ->
+                                            selectedSong = song
+                                            showSongOptions = true
+                                        }
+                                    )
+                                }
+                            }
+
                         if (uiState.recentlyPlayed.isNotEmpty()) {
                             item {
-                                SectionHeader(title = "Recently Played")
+                                PremiumSectionHeader(
+                                    title = "Recently Played",
+                                    subtitle = "Your latest listening trail"
+                                )
                             }
-                            items(uiState.recentlyPlayed.take(8)) { song ->
+                            items(uiState.recentlyPlayed.take(8), key = { it.id }) { song ->
                                 SongListItem(
                                     song = song,
                                     onClick = {
@@ -443,17 +445,16 @@ fun HomeScreen(
                                     }
                                 )
                             }
-                            item {
-                                Spacer(modifier = Modifier.height(24.dp))
-                            }
                         }
-                        
-                        // Trending Songs
+
                         if (uiState.trendingSongs.isNotEmpty()) {
                             item {
-                                SectionHeader(title = "Trending Now")
+                                PremiumSectionHeader(
+                                    title = "Trending Now",
+                                    subtitle = "What listeners are looping globally"
+                                )
                             }
-                            items(uiState.trendingSongs.take(5)) { song ->
+                            items(uiState.trendingSongs.take(6), key = { it.id }) { song ->
                                 SongListItem(
                                     song = song,
                                     onClick = {
@@ -466,17 +467,13 @@ fun HomeScreen(
                                     }
                                 )
                             }
-                            item {
-                                Spacer(modifier = Modifier.height(24.dp))
-                            }
                         }
-                        
-                        // New Releases
+
                         if (uiState.newReleases.isNotEmpty()) {
                             item {
-                                SectionHeader(
+                                PremiumSectionHeader(
                                     title = "New Releases",
-                                    onViewAll = { /* Navigate */ }
+                                    subtitle = "Recently dropped albums and sessions"
                                 )
                             }
                             item {
@@ -484,7 +481,7 @@ fun HomeScreen(
                                     contentPadding = PaddingValues(horizontal = 16.dp),
                                     horizontalArrangement = Arrangement.spacedBy(12.dp)
                                 ) {
-                                    items(uiState.newReleases) { album ->
+                                    items(uiState.newReleases, key = { it.id }) { album ->
                                         AlbumCard(
                                             album = album,
                                             onClick = {
@@ -493,16 +490,14 @@ fun HomeScreen(
                                         )
                                     }
                                 }
-                                Spacer(modifier = Modifier.height(24.dp))
                             }
                         }
-                        
-                        // Recommended Playlists
+
                         if (uiState.recommendedPlaylists.isNotEmpty()) {
                             item {
-                                SectionHeader(
-                                    title = "Playlists for You",
-                                    onViewAll = { /* Navigate */ }
+                                PremiumSectionHeader(
+                                    title = "Playlists For You",
+                                    subtitle = "High-signal collections from your taste graph"
                                 )
                             }
                             item {
@@ -510,16 +505,17 @@ fun HomeScreen(
                                     contentPadding = PaddingValues(horizontal = 16.dp),
                                     horizontalArrangement = Arrangement.spacedBy(12.dp)
                                 ) {
-                                    items(uiState.recommendedPlaylists) { playlist ->
+                                    items(uiState.recommendedPlaylists, key = { it.id }) { playlist ->
                                         PlaylistCard(
                                             playlist = playlist,
                                             onClick = {
-                                                navController.navigate(Screen.Playlist.createRoute(playlist.id))
+                                                navController.navigate(
+                                                    Screen.Playlist.createRoute(playlist.id)
+                                                )
                                             }
                                         )
                                     }
                                 }
-                                Spacer(modifier = Modifier.height(100.dp)) // Bottom padding for mini player
                             }
                         }
                     }
@@ -530,85 +526,81 @@ fun HomeScreen(
 }
 
 @Composable
-private fun NetworkStatusBanner(
-    networkStatus: NetworkStatus,
-    wasOffline: Boolean
+private fun SongCarouselSection(
+    songs: List<SongItem>,
+    onSongClick: (SongItem) -> Unit,
+    onSongLongClick: (SongItem) -> Unit
 ) {
-    val isOnline = networkStatus == NetworkStatus.Available
-    val containerColor = if (isOnline && wasOffline) {
-        Color(0xFF1C8E44)
-    } else if (!isOnline) {
-        Color(0xFFB02A2A)
-    } else {
-        return
-    }
-    
-    Surface(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(horizontal = 16.dp, vertical = 6.dp),
-        color = containerColor,
-        shape = RoundedCornerShape(14.dp)
+    LazyRow(
+        contentPadding = PaddingValues(horizontal = 16.dp),
+        horizontalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 14.dp, vertical = 8.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Icon(
-                imageVector = if (isOnline) Icons.Default.Wifi else Icons.Default.SignalWifiOff,
-                contentDescription = null,
-                tint = Color.White,
-                modifier = Modifier.size(20.dp)
-            )
-            Spacer(modifier = Modifier.width(8.dp))
-            Text(
-                text = if (isOnline && wasOffline) "Back online" else "No internet connection",
-                color = Color.White,
-                style = MaterialTheme.typography.labelLarge,
-                modifier = Modifier.weight(1f)
+        items(songs, key = { it.id }) { song ->
+            SongCard(
+                song = song,
+                onClick = { onSongClick(song) },
+                onLongClick = { onSongLongClick(song) }
             )
         }
     }
 }
 
 @Composable
-private fun SectionHeader(
-    title: String,
-    onViewAll: (() -> Unit)? = null
-) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(horizontal = 16.dp, vertical = 12.dp),
-        horizontalArrangement = Arrangement.SpaceBetween,
-        verticalAlignment = Alignment.CenterVertically
+private fun HomeLoadingState() {
+    LazyColumn(
+        modifier = Modifier.fillMaxSize(),
+        contentPadding = PaddingValues(bottom = 120.dp)
     ) {
-        Text(
-            text = title,
-            style = MaterialTheme.typography.titleLarge,
-            fontWeight = FontWeight.Bold,
-            color = MaterialTheme.colorScheme.onBackground,
-            modifier = Modifier.weight(1f) // Fixes overlapping text
-        )
-        onViewAll?.let {
-            TextButton(
-                onClick = it,
-                colors = ButtonDefaults.textButtonColors(
-                    contentColor = MaterialTheme.colorScheme.primary
-                )
+        item {
+            PremiumSkeletonHero(modifier = Modifier.padding(top = 10.dp))
+        }
+        item {
+            PremiumSectionHeader(
+                title = "Loading your feed",
+                subtitle = "Analyzing your latest sessions"
+            )
+        }
+        item {
+            LazyRow(
+                contentPadding = PaddingValues(horizontal = 16.dp),
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
             ) {
-                Text("View all")
+                items(4) {
+                    PremiumSkeletonCard()
+                }
             }
         }
+        item {
+            Spacer(modifier = Modifier.height(8.dp))
+            PremiumSectionHeader(
+                title = "Preparing tracks",
+                subtitle = "One moment"
+            )
+        }
+        items(5) {
+            PremiumSkeletonListItem()
+        }
     }
+}
+
+@Composable
+private fun HomeNetworkBanner(
+    networkStatus: NetworkStatus,
+    wasOffline: Boolean
+) {
+    val isOnlineRecovery = networkStatus == NetworkStatus.Available && wasOffline
+    val isOffline = networkStatus == NetworkStatus.Unavailable ||
+        networkStatus == NetworkStatus.Lost
+
+    if (!isOnlineRecovery && !isOffline) return
+
+    PremiumOfflineBanner(isOnlineRecovery = isOnlineRecovery)
 }
 
 private fun playSong(
     song: SongItem,
     allSongs: List<SongItem>,
-    playerConnection: com.beatloop.music.ui.PlayerConnection?
+    playerConnection: PlayerConnection?
 ) {
     playerConnection?.let { connection ->
         val mediaItems = allSongs.map { s ->

@@ -8,9 +8,11 @@ import com.beatloop.music.data.auth.IdentityMode
 import com.beatloop.music.data.preferences.AudioQuality
 import com.beatloop.music.data.preferences.PreferencesManager
 import com.beatloop.music.data.preferences.ThemeMode
+import com.beatloop.music.domain.recommendation.RecommendationContentRules
 import com.beatloop.music.sync.SyncManager
 import com.beatloop.music.sync.SyncScheduler
 import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -42,6 +44,10 @@ data class SettingsUiState(
     // Downloads
     val downloadQuality: AudioQuality = AudioQuality.VERY_HIGH,
     val videoPlaybackQuality: Int = 360,
+
+    // Personalization
+    val contentLanguage: String = "English",
+    val preferredLanguages: Set<String> = setOf("English"),
 
     // Cache
     val maxCacheSizeMb: Int = 512,
@@ -140,6 +146,25 @@ class SettingsViewModel @Inject constructor(
         viewModelScope.launch {
             preferencesManager.videoPlaybackQuality.collect { quality ->
                 _uiState.update { it.copy(videoPlaybackQuality = quality) }
+            }
+        }
+        viewModelScope.launch {
+            preferencesManager.contentLanguage.collect { languageRaw ->
+                val language = normalizeLanguageOrDefault(languageRaw)
+                _uiState.update {
+                    val preferred = if (it.preferredLanguages.isEmpty()) setOf(language) else it.preferredLanguages
+                    it.copy(contentLanguage = language, preferredLanguages = preferred)
+                }
+            }
+        }
+        viewModelScope.launch {
+            preferencesManager.preferredLanguages.collect { languagesRaw ->
+                val normalized = RecommendationContentRules
+                    .normalizeLanguages(languagesRaw.filterNot { it.equals("None", ignoreCase = true) })
+                _uiState.update {
+                    val fallback = setOf(it.contentLanguage)
+                    it.copy(preferredLanguages = if (normalized.isEmpty()) fallback else normalized)
+                }
             }
         }
         viewModelScope.launch {
@@ -255,6 +280,33 @@ class SettingsViewModel @Inject constructor(
         }
     }
 
+    fun backupNow() {
+        syncNow()
+    }
+
+    fun exportDataSnapshot() {
+        viewModelScope.launch {
+            _uiState.update { it.copy(isIdentityActionInProgress = true, statusMessage = null) }
+            runCatching {
+                preferencesManager.exportSyncPreferences()
+            }.onSuccess { exported ->
+                _uiState.update {
+                    it.copy(
+                        isIdentityActionInProgress = false,
+                        statusMessage = "Export snapshot prepared (${exported.size} entries)."
+                    )
+                }
+            }.onFailure { error ->
+                _uiState.update {
+                    it.copy(
+                        isIdentityActionInProgress = false,
+                        statusMessage = error.message ?: "Failed to export data snapshot"
+                    )
+                }
+            }
+        }
+    }
+
     fun deleteMyData() {
         viewModelScope.launch {
             _uiState.update { it.copy(isIdentityActionInProgress = true, statusMessage = null) }
@@ -367,6 +419,47 @@ class SettingsViewModel @Inject constructor(
         }
     }
 
+    fun setContentLanguage(language: String) {
+        viewModelScope.launch {
+            val normalized = normalizeLanguageOrDefault(language)
+            preferencesManager.setContentLanguage(normalized)
+
+            val currentPreferred = RecommendationContentRules
+                .normalizeLanguages(preferencesManager.preferredLanguages.first())
+                .toMutableSet()
+            if (!currentPreferred.contains(normalized)) {
+                currentPreferred.add(normalized)
+                preferencesManager.setPreferredLanguages(currentPreferred)
+            }
+        }
+    }
+
+    fun togglePreferredLanguage(language: String) {
+        viewModelScope.launch {
+            val normalized = normalizeLanguageOrDefault(language)
+            val updated = RecommendationContentRules
+                .normalizeLanguages(preferencesManager.preferredLanguages.first())
+                .toMutableSet()
+
+            if (updated.contains(normalized) && updated.size > 1) {
+                updated.remove(normalized)
+            } else {
+                updated.add(normalized)
+            }
+
+            if (updated.isEmpty()) {
+                updated.add(normalizeLanguageOrDefault(_uiState.value.contentLanguage))
+            }
+
+            preferencesManager.setPreferredLanguages(updated)
+
+            val currentContentLanguage = normalizeLanguageOrDefault(_uiState.value.contentLanguage)
+            if (!updated.contains(currentContentLanguage)) {
+                preferencesManager.setContentLanguage(updated.first())
+            }
+        }
+    }
+
     fun setMaxCacheSize(sizeMb: Int) {
         viewModelScope.launch {
             preferencesManager.setMaxCacheSizeMb(sizeMb)
@@ -377,5 +470,9 @@ class SettingsViewModel @Inject constructor(
         viewModelScope.launch {
             _uiState.update { it.copy(currentCacheSizeMb = 0) }
         }
+    }
+
+    private fun normalizeLanguageOrDefault(value: String?): String {
+        return RecommendationContentRules.normalizeLanguage(value) ?: "English"
     }
 }

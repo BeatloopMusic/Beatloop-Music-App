@@ -47,6 +47,7 @@ data class RecommendationContext(
     val recentRecommendationIds: Set<String> = emptySet(),
     val queueSongIds: Set<String> = emptySet(),
     val topArtistWeights: Map<String, Double> = emptyMap(),
+    val enforcedLanguages: Set<String> = emptySet(),
     val preferredLanguages: Set<String> = emptySet(),
     val preferredSingers: Set<String> = emptySet(),
     val preferredLyricists: Set<String> = emptySet(),

@@ -9,24 +9,32 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.Crossfade
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.ui.Modifier
 import androidx.core.content.ContextCompat
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import androidx.lifecycle.lifecycleScope
+import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.media3.session.MediaController
 import androidx.media3.session.SessionToken
 import com.beatloop.music.playback.MusicService
 import com.beatloop.music.ui.BeatloopApp
 import com.beatloop.music.ui.LocalPlayerConnection
 import com.beatloop.music.ui.PlayerConnection
+import com.beatloop.music.ui.viewmodel.AppThemeState
+import com.beatloop.music.ui.viewmodel.AppThemeViewModel
 import com.beatloop.music.ui.theme.BeatloopTheme
+import com.beatloop.music.data.preferences.ThemeMode
 import com.google.common.util.concurrent.ListenableFuture
 import com.google.common.util.concurrent.MoreExecutors
 import dagger.hilt.android.AndroidEntryPoint
@@ -53,15 +61,37 @@ class MainActivity : ComponentActivity() {
         requestPermissions()
         
         setContent {
-            BeatloopTheme {
-                Surface(
-                    modifier = Modifier.fillMaxSize(),
-                    color = MaterialTheme.colorScheme.background
+            val themeViewModel: AppThemeViewModel = hiltViewModel()
+            val themeState by themeViewModel.themeState.collectAsState()
+            val darkTheme = when (themeState.themeMode) {
+                ThemeMode.SYSTEM -> isSystemInDarkTheme()
+                ThemeMode.DARK -> true
+                ThemeMode.LIGHT -> false
+            }
+
+            Crossfade(
+                targetState = AppThemeState(
+                    themeMode = if (darkTheme) ThemeMode.DARK else ThemeMode.LIGHT,
+                    dynamicColorEnabled = themeState.dynamicColorEnabled,
+                    amoledBlackEnabled = themeState.amoledBlackEnabled
+                ),
+                animationSpec = tween(420),
+                label = "theme_crossfade"
+            ) { animatedThemeState ->
+                BeatloopTheme(
+                    darkTheme = animatedThemeState.themeMode == ThemeMode.DARK,
+                    dynamicColor = animatedThemeState.dynamicColorEnabled,
+                    amoledBlack = animatedThemeState.amoledBlackEnabled
                 ) {
-                    CompositionLocalProvider(
-                        LocalPlayerConnection provides playerConnection
+                    Surface(
+                        modifier = Modifier.fillMaxSize(),
+                        color = MaterialTheme.colorScheme.background
                     ) {
-                        BeatloopApp()
+                        CompositionLocalProvider(
+                            LocalPlayerConnection provides playerConnection
+                        ) {
+                            BeatloopApp()
+                        }
                     }
                 }
             }
