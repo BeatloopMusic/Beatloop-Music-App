@@ -75,6 +75,8 @@ import com.beatloop.music.ui.navigation.Screen
 import com.beatloop.music.ui.viewmodel.SearchViewModel
 import com.beatloop.music.ui.viewmodel.SongActionsViewModel
 
+private const val SEARCH_SEED_QUERY_KEY = "seed_search_query"
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SearchScreen(
@@ -223,6 +225,21 @@ fun SearchScreen(
         if (searchQuery.isBlank()) return
         viewModel.search(searchQuery.trim(), selectedFilterLabel.toSearchFilter())
         focusManager.clearFocus()
+    }
+
+    LaunchedEffect(navController) {
+        val seededQuery = navController.previousBackStackEntry
+            ?.savedStateHandle
+            ?.remove<String>(SEARCH_SEED_QUERY_KEY)
+            ?.trim()
+            .orEmpty()
+
+        if (seededQuery.isNotBlank()) {
+            searchQuery = seededQuery
+            selectedFilterLabel = "All"
+            viewModel.search(seededQuery, SearchFilter.All)
+            focusManager.clearFocus()
+        }
     }
 
     LaunchedEffect(selectedFilterLabel) {
@@ -479,6 +496,20 @@ fun SearchScreen(
                                                         contentDescription = null,
                                                         modifier = Modifier.size(56.dp)
                                                     )
+                                                },
+                                                trailingContent = {
+                                                    IconButton(
+                                                        onClick = {
+                                                            songActionsViewModel.saveRemotePlaylist(playlist, context)
+                                                        },
+                                                        modifier = Modifier.size(34.dp)
+                                                    ) {
+                                                        Icon(
+                                                            imageVector = Icons.AutoMirrored.Filled.PlaylistAdd,
+                                                            contentDescription = "Save playlist",
+                                                            modifier = Modifier.size(20.dp)
+                                                        )
+                                                    }
                                                 }
                                             )
                                         }

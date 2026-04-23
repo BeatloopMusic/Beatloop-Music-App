@@ -20,6 +20,7 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -142,9 +143,9 @@ fun PlaylistScreen(
         AddToPlaylistBottomSheet(
             playlists = playlists,
             onDismiss = { showAddToPlaylist = false },
-            onSelectPlaylist = { playlistId ->
+            onSelectPlaylist = { targetPlaylistId ->
                 selectedSong?.let { song ->
-                    songActionsViewModel.addToPlaylist(playlistId, song, context)
+                    songActionsViewModel.addToPlaylist(targetPlaylistId, song, context)
                 }
                 showAddToPlaylist = false
             },
@@ -231,18 +232,56 @@ fun PlaylistScreen(
             }
             uiState.playlist != null -> {
                 val playlist = uiState.playlist!!
+                val configuration = LocalConfiguration.current
+                val isCompactWidth = configuration.screenWidthDp < 360
+                val isCompactHeight = configuration.screenHeightDp < 700
+                val headerHeight = if (isCompactHeight) 220.dp else 280.dp
+                val bottomListPadding = if (isCompactHeight) 132.dp else 148.dp
+
+                val playAllSongs: () -> Unit = {
+                    playerConnection?.let { conn ->
+                        val mediaItems = uiState.songs.map { song ->
+                            createMediaItem(
+                                id = song.id,
+                                title = song.title,
+                                artist = song.artistsText,
+                                thumbnailUrl = song.thumbnailUrl,
+                                localPath = song.localPath
+                            )
+                        }
+                        conn.setMediaItems(mediaItems, 0)
+                    }
+                    Unit
+                }
+
+                val shuffleSongs: () -> Unit = {
+                    playerConnection?.let { conn ->
+                        val mediaItems = uiState.songs.shuffled().map { song ->
+                            createMediaItem(
+                                id = song.id,
+                                title = song.title,
+                                artist = song.artistsText,
+                                thumbnailUrl = song.thumbnailUrl,
+                                localPath = song.localPath
+                            )
+                        }
+                        conn.setMediaItems(mediaItems, 0)
+                    }
+                    Unit
+                }
                 
                 LazyColumn(
                     modifier = Modifier
                         .fillMaxSize()
-                        .padding(padding)
+                        .padding(padding),
+                    contentPadding = PaddingValues(bottom = bottomListPadding)
                 ) {
                     // Header with Playlist Cover
                     item {
                         Box(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .height(280.dp)
+                                .height(headerHeight)
                         ) {
                             AsyncImage(
                                 model = playlist.thumbnailUrl,
@@ -304,56 +343,55 @@ fun PlaylistScreen(
                             }
                             
                             // Action Buttons
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(vertical = 16.dp),
-                                horizontalArrangement = Arrangement.spacedBy(12.dp)
-                            ) {
-                                // Play Button
-                                Button(
-                                    onClick = {
-                                        playerConnection?.let { conn ->
-                                            val mediaItems = uiState.songs.map { song ->
-                                                createMediaItem(
-                                                    id = song.id,
-                                                    title = song.title,
-                                                    artist = song.artistsText,
-                                                    thumbnailUrl = song.thumbnailUrl,
-                                                    localPath = song.localPath
-                                                )
-                                            }
-                                            conn.setMediaItems(mediaItems, 0)
-                                        }
-                                    },
-                                    modifier = Modifier.weight(1f)
+                            if (isCompactWidth) {
+                                Column(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(vertical = 16.dp),
+                                    verticalArrangement = Arrangement.spacedBy(10.dp)
                                 ) {
-                                    Icon(Icons.Default.PlayArrow, contentDescription = null)
-                                    Spacer(modifier = Modifier.width(8.dp))
-                                    Text("Play")
+                                    Button(
+                                        onClick = playAllSongs,
+                                        modifier = Modifier.fillMaxWidth()
+                                    ) {
+                                        Icon(Icons.Default.PlayArrow, contentDescription = null)
+                                        Spacer(modifier = Modifier.width(8.dp))
+                                        Text("Play")
+                                    }
+
+                                    OutlinedButton(
+                                        onClick = shuffleSongs,
+                                        modifier = Modifier.fillMaxWidth()
+                                    ) {
+                                        Icon(Icons.Default.Shuffle, contentDescription = null)
+                                        Spacer(modifier = Modifier.width(8.dp))
+                                        Text("Shuffle")
+                                    }
                                 }
-                                
-                                // Shuffle Button
-                                OutlinedButton(
-                                    onClick = {
-                                        playerConnection?.let { conn ->
-                                            val mediaItems = uiState.songs.shuffled().map { song ->
-                                                createMediaItem(
-                                                    id = song.id,
-                                                    title = song.title,
-                                                    artist = song.artistsText,
-                                                    thumbnailUrl = song.thumbnailUrl,
-                                                    localPath = song.localPath
-                                                )
-                                            }
-                                            conn.setMediaItems(mediaItems, 0)
-                                        }
-                                    },
-                                    modifier = Modifier.weight(1f)
+                            } else {
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(vertical = 16.dp),
+                                    horizontalArrangement = Arrangement.spacedBy(12.dp)
                                 ) {
-                                    Icon(Icons.Default.Shuffle, contentDescription = null)
-                                    Spacer(modifier = Modifier.width(8.dp))
-                                    Text("Shuffle")
+                                    Button(
+                                        onClick = playAllSongs,
+                                        modifier = Modifier.weight(1f)
+                                    ) {
+                                        Icon(Icons.Default.PlayArrow, contentDescription = null)
+                                        Spacer(modifier = Modifier.width(8.dp))
+                                        Text("Play")
+                                    }
+
+                                    OutlinedButton(
+                                        onClick = shuffleSongs,
+                                        modifier = Modifier.weight(1f)
+                                    ) {
+                                        Icon(Icons.Default.Shuffle, contentDescription = null)
+                                        Spacer(modifier = Modifier.width(8.dp))
+                                        Text("Shuffle")
+                                    }
                                 }
                             }
                         }
@@ -406,10 +444,6 @@ fun PlaylistScreen(
                         }
                     }
                     
-                    // Bottom spacing
-                    item {
-                        Spacer(modifier = Modifier.height(100.dp))
-                    }
                 }
             }
         }

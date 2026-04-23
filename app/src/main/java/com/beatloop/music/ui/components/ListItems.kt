@@ -8,6 +8,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.PlaylistAdd
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material3.*
@@ -18,6 +19,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import coil.compose.AsyncImage
@@ -165,9 +167,16 @@ fun AlbumCard(
     onClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val screenWidthDp = LocalConfiguration.current.screenWidthDp
+    val cardWidth = when {
+        screenWidthDp < 360 -> 146.dp
+        screenWidthDp < 412 -> 160.dp
+        else -> 172.dp
+    }
+
     Card(
         modifier = modifier
-            .width(168.dp)
+            .width(cardWidth)
             .clickable(onClick = onClick),
         shape = RoundedCornerShape(20.dp),
         colors = CardDefaults.cardColors(
@@ -257,11 +266,19 @@ fun AlbumCard(
 fun PlaylistCard(
     playlist: PlaylistItem,
     onClick: () -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    onSaveClick: (() -> Unit)? = null
 ) {
+    val screenWidthDp = LocalConfiguration.current.screenWidthDp
+    val cardWidth = when {
+        screenWidthDp < 360 -> 146.dp
+        screenWidthDp < 412 -> 160.dp
+        else -> 172.dp
+    }
+
     Card(
         modifier = modifier
-            .width(168.dp)
+            .width(cardWidth)
             .clickable(onClick = onClick),
         shape = RoundedCornerShape(20.dp),
         colors = CardDefaults.cardColors(
@@ -293,6 +310,22 @@ fun PlaylistCard(
                             )
                         )
                 )
+
+                    if (onSaveClick != null) {
+                        FilledTonalIconButton(
+                            onClick = onSaveClick,
+                            modifier = Modifier
+                                .align(Alignment.TopEnd)
+                                .padding(8.dp)
+                                .size(32.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.AutoMirrored.Filled.PlaylistAdd,
+                                contentDescription = "Save playlist",
+                                modifier = Modifier.size(18.dp)
+                            )
+                        }
+                    }
             }
             
             Column(
@@ -339,9 +372,16 @@ fun SongCard(
     onLongClick: (() -> Unit)? = null,
     modifier: Modifier = Modifier
 ) {
+    val screenWidthDp = LocalConfiguration.current.screenWidthDp
+    val cardWidth = when {
+        screenWidthDp < 360 -> 146.dp
+        screenWidthDp < 412 -> 160.dp
+        else -> 172.dp
+    }
+
     Card(
         modifier = modifier
-            .width(168.dp)
+            .width(cardWidth)
             .combinedClickable(
                 onClick = onClick,
                 onLongClick = onLongClick
@@ -426,9 +466,21 @@ fun ArtistCard(
     onClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val screenWidthDp = LocalConfiguration.current.screenWidthDp
+    val cardWidth = when {
+        screenWidthDp < 360 -> 122.dp
+        screenWidthDp < 412 -> 136.dp
+        else -> 148.dp
+    }
+    val avatarSize = when {
+        screenWidthDp < 360 -> 82.dp
+        screenWidthDp < 412 -> 92.dp
+        else -> 100.dp
+    }
+
     Card(
         modifier = modifier
-            .width(140.dp)
+            .width(cardWidth)
             .clickable(onClick = onClick),
         shape = RoundedCornerShape(20.dp),
         colors = CardDefaults.cardColors(
@@ -445,7 +497,7 @@ fun ArtistCard(
                 model = artist.thumbnailUrl,
                 contentDescription = null,
                 modifier = Modifier
-                    .size(92.dp)
+                    .size(avatarSize)
                     .clip(CircleShape),
                 contentScale = ContentScale.Crop
             )

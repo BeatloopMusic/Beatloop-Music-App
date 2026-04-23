@@ -93,6 +93,12 @@ class SyncManager @Inject constructor(
                     "songId" to song.id,
                     "title" to song.title,
                     "artistsText" to song.artistsText,
+                    "artistId" to song.artistId,
+                    "albumId" to song.albumId,
+                    "duration" to song.duration,
+                    "thumbnailUrl" to song.thumbnailUrl,
+                    "liked" to song.liked,
+                    "likedAt" to song.likedAt,
                     "playCount" to song.playCount,
                     "lastPlayedAt" to (song.lastPlayedAt ?: 0L),
                     "lastUpdatedTimestamp" to song.lastUpdatedTimestamp
@@ -211,6 +217,12 @@ class SyncManager @Inject constructor(
                 val songId = doc.id
                 val title = doc.getString("title").orEmpty().ifBlank { "Unknown Title" }
                 val artists = doc.getString("artistsText").orEmpty().ifBlank { "Unknown Artist" }
+                val artistId = doc.getString("artistId")
+                val albumId = doc.getString("albumId")
+                val duration = doc.getLong("duration") ?: 0L
+                val thumbnailUrl = doc.getString("thumbnailUrl")
+                val liked = doc.getBoolean("liked") == true
+                val likedAt = doc.getLong("likedAt")?.takeIf { it > 0L }
                 val playCount = (doc.getLong("playCount") ?: 0L).toInt().coerceAtLeast(0)
                 val lastPlayedAt = doc.getLong("lastPlayedAt")?.takeIf { it > 0L }
 
@@ -221,9 +233,16 @@ class SyncManager @Inject constructor(
                             id = songId,
                             title = title,
                             artistsText = artists,
+                            artistId = artistId,
+                            albumId = albumId,
+                            duration = duration,
+                            thumbnailUrl = thumbnailUrl,
+                            liked = liked,
+                            likedAt = likedAt,
                             playCount = playCount,
                             lastPlayedAt = lastPlayedAt,
                             downloadState = DownloadState.NOT_DOWNLOADED,
+                            createdAt = remoteTimestamp,
                             lastUpdatedTimestamp = remoteTimestamp,
                             isSynced = true
                         )
@@ -233,6 +252,12 @@ class SyncManager @Inject constructor(
                         songId = songId,
                         title = title,
                         artistsText = artists,
+                        artistId = artistId,
+                        albumId = albumId,
+                        duration = duration,
+                        thumbnailUrl = thumbnailUrl,
+                        liked = liked,
+                        likedAt = likedAt,
                         playCount = playCount,
                         lastPlayedAt = lastPlayedAt,
                         lastUpdatedTimestamp = remoteTimestamp,

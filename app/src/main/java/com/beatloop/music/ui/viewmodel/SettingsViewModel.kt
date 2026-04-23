@@ -207,24 +207,51 @@ class SettingsViewModel @Inject constructor(
 
             authManager.loginWithGoogle(activity)
                 .onSuccess { newUserId ->
-                    if (previousWasAnonymous && previousUserId != newUserId) {
+                    val migrationResult = if (previousWasAnonymous && previousUserId != newUserId) {
                         syncManager.mergeGuestDataToCurrentUser(
                             guestUserId = previousUserId,
                             targetUserId = newUserId,
                             deleteSource = true
                         )
+                    } else {
+                        Result.success(Unit)
                     }
 
-                    syncManager.mergeLocalAndRemote()
-                    syncScheduler.schedulePeriodicSync()
-                    syncScheduler.enqueueImmediateSync()
-                    refreshIdentityState()
-                    _uiState.update {
-                        it.copy(
-                            isIdentityActionInProgress = false,
-                            statusMessage = "Signed in with Google and sync started."
-                        )
-                    }
+                    migrationResult.fold(
+                        onSuccess = {
+                            syncManager.mergeLocalAndRemote().fold(
+                                onSuccess = {
+                                    syncScheduler.schedulePeriodicSync()
+                                    syncScheduler.enqueueImmediateSync()
+                                    refreshIdentityState()
+                                    _uiState.update {
+                                        it.copy(
+                                            isIdentityActionInProgress = false,
+                                            statusMessage = "Signed in with Google and sync completed."
+                                        )
+                                    }
+                                },
+                                onFailure = { error ->
+                                    refreshIdentityState()
+                                    _uiState.update {
+                                        it.copy(
+                                            isIdentityActionInProgress = false,
+                                            statusMessage = error.message ?: "Signed in, but sync failed"
+                                        )
+                                    }
+                                }
+                            )
+                        },
+                        onFailure = { error ->
+                            refreshIdentityState()
+                            _uiState.update {
+                                it.copy(
+                                    isIdentityActionInProgress = false,
+                                    statusMessage = error.message ?: "Signed in, but guest data migration failed"
+                                )
+                            }
+                        }
+                    )
                 }
                 .onFailure { error ->
                     _uiState.update {
@@ -242,15 +269,28 @@ class SettingsViewModel @Inject constructor(
             _uiState.update { it.copy(isIdentityActionInProgress = true, statusMessage = null) }
             authManager.loginAnonymously()
                 .onSuccess {
-                    syncScheduler.schedulePeriodicSync()
-                    syncScheduler.enqueueImmediateSync()
-                    refreshIdentityState()
-                    _uiState.update {
-                        it.copy(
-                            isIdentityActionInProgress = false,
-                            statusMessage = "Guest cloud sync enabled."
-                        )
-                    }
+                    syncManager.mergeLocalAndRemote().fold(
+                        onSuccess = {
+                            syncScheduler.schedulePeriodicSync()
+                            syncScheduler.enqueueImmediateSync()
+                            refreshIdentityState()
+                            _uiState.update {
+                                it.copy(
+                                    isIdentityActionInProgress = false,
+                                    statusMessage = "Guest cloud sync enabled and data synchronized."
+                                )
+                            }
+                        },
+                        onFailure = { error ->
+                            refreshIdentityState()
+                            _uiState.update {
+                                it.copy(
+                                    isIdentityActionInProgress = false,
+                                    statusMessage = error.message ?: "Guest login succeeded, but sync failed"
+                                )
+                            }
+                        }
+                    )
                 }
                 .onFailure { error ->
                     _uiState.update {
@@ -266,24 +306,36 @@ class SettingsViewModel @Inject constructor(
     fun syncNow() {
         viewModelScope.launch {
             _uiState.update { it.copy(isIdentityActionInProgress = true, statusMessage = null) }
-            syncManager.mergeLocalAndRemote()
-                .onSuccess {
-                    syncScheduler.enqueueImmediateSync()
+            ensureCloudSessionForSync().fold(
+                onSuccess = {
+                    syncManager.mergeLocalAndRemote()
+                        .onSuccess {
+                            syncScheduler.enqueueImmediateSync()
+                            _uiState.update {
+                                it.copy(
+                                    isIdentityActionInProgress = false,
+                                    statusMessage = "Sync completed successfully."
+                                )
+                            }
+                        }
+                        .onFailure { error ->
+                            _uiState.update {
+                                it.copy(
+                                    isIdentityActionInProgress = false,
+                                    statusMessage = error.message ?: "Sync failed"
+                                )
+                            }
+                        }
+                },
+                onFailure = { error ->
                     _uiState.update {
                         it.copy(
                             isIdentityActionInProgress = false,
-                            statusMessage = "Sync completed successfully."
+                            statusMessage = error.message ?: "Cloud session unavailable"
                         )
                     }
                 }
-                .onFailure { error ->
-                    _uiState.update {
-                        it.copy(
-                            isIdentityActionInProgress = false,
-                            statusMessage = error.message ?: "Sync failed"
-                        )
-                    }
-                }
+            )
         }
     }
 
@@ -492,5 +544,25 @@ class SettingsViewModel @Inject constructor(
 
     private fun normalizeCountryOrDefault(value: String?): String {
         return RecommendationContentRules.normalizeCountry(value) ?: "US"
+    }
+
+    private suspend fun ensureCloudSessionForSync(): Result<Unit> {
+        if (authManager.hasCloudUser() && !authManager.getCurrentFirebaseUid().isNullOrBlank()) {
+            return Result.success(Unit)
+        }
+
+        return authManager.loginAnonymously()
+            .map { Unit }
+            .onSuccess {
+                refreshIdentityState()
+                syncScheduler.schedulePeriodicSync()
+            }
+            .recoverCatching { error ->
+                throw IllegalStateException(
+                    error.message
+                        ?: "Cloud sync is unavailable. Verify Firebase project configuration and network connectivity.",
+                    error
+                )
+            }
     }
 }

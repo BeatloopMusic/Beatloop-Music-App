@@ -10,12 +10,12 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import com.beatloop.music.playback.createMediaItem
 import com.beatloop.music.ui.LocalPlayerConnection
+import com.beatloop.music.ui.components.PremiumEmptyState
 import com.beatloop.music.ui.components.SongListItem
 import com.beatloop.music.ui.viewmodel.LibraryViewModel
 
@@ -41,36 +41,14 @@ fun HistoryScreen(
         }
     ) { paddingValues ->
         if (history.isEmpty()) {
-            Box(
+            PremiumEmptyState(
+                title = "No listening history yet",
+                message = "Tracks you finish or preview will appear here so you can quickly replay them.",
                 modifier = Modifier
                     .fillMaxSize()
                     .padding(paddingValues),
-                contentAlignment = Alignment.Center
-            ) {
-                Column(
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.Center
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.History,
-                        contentDescription = null,
-                        modifier = Modifier.size(64.dp),
-                        tint = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    Spacer(modifier = Modifier.height(16.dp))
-                    Text(
-                        text = "No play history yet",
-                        style = MaterialTheme.typography.titleMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Text(
-                        text = "Songs you play will appear here",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-            }
+                icon = Icons.Default.History
+            )
         } else {
             LazyColumn(
                 modifier = Modifier

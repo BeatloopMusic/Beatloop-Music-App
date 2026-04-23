@@ -10,7 +10,9 @@ import com.beatloop.music.R
 import com.google.android.gms.auth.api.signin.GoogleSignIn
 import com.google.android.gms.auth.api.signin.GoogleSignInAccount
 import com.google.android.gms.auth.api.signin.GoogleSignInOptions
+import com.google.android.gms.auth.api.signin.GoogleSignInStatusCodes
 import com.google.android.gms.common.api.ApiException
+import com.google.android.gms.common.api.CommonStatusCodes
 import com.google.firebase.Firebase
 import com.google.firebase.FirebaseApp
 import com.google.firebase.auth.FirebaseAuth
@@ -71,6 +73,8 @@ class AuthManager @Inject constructor(
                 .requestEmail()
                 .build()
             val googleSignInClient = GoogleSignIn.getClient(hostActivity, options)
+            // Always sign out silently before launching to avoid stale cached tokens.
+            runCatching { googleSignInClient.signOut().await() }
             val account = launchGoogleSignIn(hostActivity, googleSignInClient.signInIntent)
             val idToken = account.idToken
                 ?: throw IllegalStateException("Google sign-in did not return an ID token")
@@ -83,6 +87,29 @@ class AuthManager @Inject constructor(
             localIdentityStore.setIdentityMode(IdentityMode.GOOGLE)
             uid
         }.recoverCatching { error ->
+            if (error is ApiException) {
+                when (error.statusCode) {
+                    GoogleSignInStatusCodes.SIGN_IN_CANCELLED -> {
+                        throw IllegalStateException("Google sign-in was cancelled")
+                    }
+
+                    CommonStatusCodes.DEVELOPER_ERROR -> {
+                        throw IllegalStateException(
+                            "Google sign-in configuration mismatch. Add debug/release SHA-1 and SHA-256 for package com.beatloop.music in Firebase Project Settings, then download a fresh app/google-services.json.",
+                            error
+                        )
+                    }
+
+                    GoogleSignInStatusCodes.SIGN_IN_FAILED,
+                    CommonStatusCodes.INTERNAL_ERROR -> {
+                        throw IllegalStateException(
+                            "Google sign-in failed due to a temporary Google Play Services issue. Please retry.",
+                            error
+                        )
+                    }
+                }
+            }
+
             if (
                 error.message?.contains("package certificate hash", ignoreCase = true) == true ||
                 error.message?.contains("SHA", ignoreCase = true) == true

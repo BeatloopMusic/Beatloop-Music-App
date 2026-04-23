@@ -56,6 +56,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -67,7 +68,6 @@ import com.beatloop.music.playback.createMediaItem
 import com.beatloop.music.ui.LocalPlayerConnection
 import com.beatloop.music.ui.components.PremiumEmptyState
 import com.beatloop.music.ui.components.PremiumGlassSurface
-import com.beatloop.music.ui.components.PremiumHeroCard
 import com.beatloop.music.ui.components.PremiumScreenBackground
 import com.beatloop.music.ui.components.PremiumSectionHeader
 import com.beatloop.music.ui.components.SongListItem
@@ -107,12 +107,12 @@ fun LibraryScreen(
     val pagerState = rememberPagerState(pageCount = { tabs.size })
     val scope = rememberCoroutineScope()
 
-    val archiveSongs = remember(uiState) {
+    val librarySongs = remember(uiState) {
         (uiState.likedSongs + uiState.playHistory + uiState.downloads).distinctBy { it.id }
     }
 
-    val artistsArchive = remember(archiveSongs) {
-        archiveSongs
+    val artistsArchive = remember(librarySongs) {
+        librarySongs
             .groupBy { it.artistsText.ifBlank { "Unknown Artist" } }
             .map { (artistName, songs) ->
                 ArtistArchive(
@@ -125,8 +125,8 @@ fun LibraryScreen(
             .sortedByDescending { it.count }
     }
 
-    val albumsArchive = remember(archiveSongs) {
-        archiveSongs
+    val albumsArchive = remember(librarySongs) {
+        librarySongs
             .filter { !it.albumId.isNullOrBlank() }
             .groupBy { it.albumId!! }
             .map { (albumId, songs) ->
@@ -150,12 +150,12 @@ fun LibraryScreen(
                 title = {
                     Column {
                         Text(
-                            text = "Your Archive",
+                            text = "Library",
                             style = MaterialTheme.typography.headlineSmall,
                             fontWeight = FontWeight.Bold
                         )
                         Text(
-                            text = "Pinned collections and listening history",
+                            text = "Playlists, downloads, likes, and listening activity",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -173,16 +173,20 @@ fun LibraryScreen(
                 .padding(padding)
         ) {
             Column(modifier = Modifier.fillMaxSize()) {
-                PremiumHeroCard(
-                    title = "${archiveSongs.size} tracks across your library",
-                    subtitle = "${uiState.playlists.size} playlists • ${uiState.downloads.size} downloads • ${uiState.likedSongs.size} liked",
-                    badge = "Personal Archive",
-                    onClick = {
-                        scope.launch { pagerState.animateScrollToPage(0) }
-                    }
+                LibraryOverviewCard(
+                    playlistsCount = uiState.playlists.size,
+                    downloadsCount = uiState.downloads.size,
+                    likesCount = uiState.likedSongs.size,
+                    historyCount = uiState.playHistory.size,
+                    songsCount = librarySongs.size
                 )
 
                 Spacer(modifier = Modifier.height(8.dp))
+
+                PremiumSectionHeader(
+                    title = "Quick Access",
+                    subtitle = "Jump to key library sections"
+                )
 
                 LazyRow(
                     contentPadding = PaddingValues(horizontal = 16.dp),
@@ -382,9 +386,16 @@ private fun LibraryQuickActionCard(
     icon: ImageVector,
     onClick: () -> Unit
 ) {
+    val screenWidthDp = LocalConfiguration.current.screenWidthDp
+    val cardWidth = when {
+        screenWidthDp < 360 -> 118.dp
+        screenWidthDp < 412 -> 130.dp
+        else -> 142.dp
+    }
+
     PremiumGlassSurface(
         modifier = Modifier
-            .width(132.dp)
+            .width(cardWidth)
             .clickable(onClick = onClick)
     ) {
         Column(
@@ -402,10 +413,42 @@ private fun LibraryQuickActionCard(
             Text(
                 text = value,
                 style = MaterialTheme.typography.titleLarge,
-                fontWeight = FontWeight.Bold
+                fontWeight = FontWeight.Bold,
+                color = MaterialTheme.colorScheme.primary
             )
             Text(
                 text = title,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+    }
+}
+
+@Composable
+private fun LibraryOverviewCard(
+    playlistsCount: Int,
+    downloadsCount: Int,
+    likesCount: Int,
+    historyCount: Int,
+    songsCount: Int
+) {
+    PremiumGlassSurface(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp)
+    ) {
+        Column(
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 14.dp)
+        ) {
+            Text(
+                text = "$songsCount tracks in your library",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold
+            )
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                text = "$playlistsCount playlists • $downloadsCount downloads • $likesCount liked • $historyCount history",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )

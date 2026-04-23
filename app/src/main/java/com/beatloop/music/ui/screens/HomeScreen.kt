@@ -1,8 +1,11 @@
 package com.beatloop.music.ui.screens
 
+import android.graphics.Color as AndroidColor
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -41,14 +44,19 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.navigation.NavController
+import com.beatloop.music.data.model.MoodGenreItem
 import com.beatloop.music.data.model.SongItem
 import com.beatloop.music.playback.createMediaItem
 import com.beatloop.music.ui.LocalPlayerConnection
@@ -58,6 +66,7 @@ import com.beatloop.music.ui.components.AlbumCard
 import com.beatloop.music.ui.components.PlaylistCard
 import com.beatloop.music.ui.components.PremiumEmptyState
 import com.beatloop.music.ui.components.PremiumErrorState
+import com.beatloop.music.ui.components.PremiumGlassSurface
 import com.beatloop.music.ui.components.PremiumHeroCard
 import com.beatloop.music.ui.components.PremiumOfflineBanner
 import com.beatloop.music.ui.components.PremiumScreenBackground
@@ -294,6 +303,7 @@ fun HomeScreen(
                     uiState.personalizedRecommendations.isEmpty() &&
                     uiState.recentlyPlayed.isEmpty() &&
                     uiState.trendingSongs.isEmpty() &&
+                    uiState.moodsAndGenres.isEmpty() &&
                     uiState.genreSections.isEmpty() &&
                     uiState.newReleases.isEmpty() &&
                     uiState.recommendedPlaylists.isEmpty() -> {
@@ -307,7 +317,6 @@ fun HomeScreen(
                 }
 
                 else -> {
-                    val continueListening = uiState.quickPicks.ifEmpty { uiState.recentlyPlayed }
                     val becauseYouPlayed =
                         (uiState.quickPicks + uiState.personalizedRecommendations)
                             .distinctBy { it.id }
@@ -332,27 +341,6 @@ fun HomeScreen(
                                         )
                                     },
                                     modifier = Modifier.padding(top = 8.dp)
-                                )
-                            }
-                        }
-
-                        if (continueListening.isNotEmpty()) {
-                            item {
-                                PremiumSectionHeader(
-                                    title = "Continue Listening",
-                                    subtitle = "Jump back in instantly"
-                                )
-                            }
-                            item {
-                                SongCarouselSection(
-                                    songs = continueListening.take(20),
-                                    onSongClick = { song ->
-                                        playSong(song, continueListening, playerConnection)
-                                    },
-                                    onSongLongClick = { song ->
-                                        selectedSong = song
-                                        showSongOptions = true
-                                    }
                                 )
                             }
                         }
@@ -398,6 +386,28 @@ fun HomeScreen(
                                     onSongLongClick = { song ->
                                         selectedSong = song
                                         showSongOptions = true
+                                    }
+                                )
+                            }
+                        }
+
+                        if (uiState.moodsAndGenres.isNotEmpty()) {
+                            item {
+                                PremiumSectionHeader(
+                                    title = "Moods & Genres",
+                                    subtitle = "Like YouTube Music, pick a vibe and dive in"
+                                )
+                            }
+                            item {
+                                MoodGenreCarouselSection(
+                                    moodItems = uiState.moodsAndGenres.take(16),
+                                    onMoodClick = { mood ->
+                                        navController.currentBackStackEntry
+                                            ?.savedStateHandle
+                                            ?.set("seed_search_query", mood.title)
+                                        navController.navigate(Screen.Search.route) {
+                                            launchSingleTop = true
+                                        }
                                     }
                                 )
                             }
@@ -512,6 +522,9 @@ fun HomeScreen(
                                                 navController.navigate(
                                                     Screen.Playlist.createRoute(playlist.id)
                                                 )
+                                            },
+                                            onSaveClick = {
+                                                songActionsViewModel.saveRemotePlaylist(playlist, context)
                                             }
                                         )
                                     }
@@ -543,6 +556,80 @@ private fun SongCarouselSection(
             )
         }
     }
+}
+
+@Composable
+private fun MoodGenreCarouselSection(
+    moodItems: List<MoodGenreItem>,
+    onMoodClick: (MoodGenreItem) -> Unit
+) {
+    LazyRow(
+        contentPadding = PaddingValues(horizontal = 16.dp),
+        horizontalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        items(
+            items = moodItems,
+            key = { item -> "${item.title}_${item.params}" }
+        ) { item ->
+            MoodGenreCard(
+                item = item,
+                onClick = { onMoodClick(item) }
+            )
+        }
+    }
+}
+
+@Composable
+private fun MoodGenreCard(
+    item: MoodGenreItem,
+    onClick: () -> Unit
+) {
+    val screenWidthDp = LocalConfiguration.current.screenWidthDp
+    val cardWidth = when {
+        screenWidthDp < 360 -> 144.dp
+        screenWidthDp < 412 -> 160.dp
+        else -> 176.dp
+    }
+    val cardHeight = if (screenWidthDp < 360) 96.dp else 104.dp
+
+    val baseColor = item.color
+        ?.let { parseMoodColor(it) }
+        ?: MaterialTheme.colorScheme.primary
+
+    val gradient = Brush.linearGradient(
+        colors = listOf(
+            baseColor.copy(alpha = 0.42f),
+            baseColor.copy(alpha = 0.20f),
+            MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.70f)
+        )
+    )
+
+    PremiumGlassSurface(
+        modifier = Modifier
+            .width(cardWidth)
+            .height(cardHeight)
+            .clickable(onClick = onClick),
+        tonalElevation = 3.dp
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(gradient)
+                .padding(horizontal = 14.dp, vertical = 12.dp)
+        ) {
+            Text(
+                text = item.title,
+                style = MaterialTheme.typography.titleMedium,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.align(Alignment.BottomStart)
+            )
+        }
+    }
+}
+
+private fun parseMoodColor(value: String): Color? {
+    return runCatching { Color(AndroidColor.parseColor(value)) }.getOrNull()
 }
 
 @Composable

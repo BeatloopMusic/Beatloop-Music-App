@@ -7,6 +7,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.beatloop.music.data.model.DownloadState
 import com.beatloop.music.data.model.LocalPlaylist
+import com.beatloop.music.data.model.PlaylistItem
 import com.beatloop.music.data.model.SongItem
 import com.beatloop.music.data.repository.MusicRepository
 import com.beatloop.music.download.DownloadManager
@@ -108,7 +109,7 @@ class SongActionsViewModel @Inject constructor(
         }
     }
     
-fun addToPlaylist(playlistId: Long, song: SongItem, context: Context) {
+    fun addToPlaylist(playlistId: Long, song: SongItem, context: Context) {
         viewModelScope.launch {
             val added = musicRepository.addSongToPlaylist(playlistId, song)     
             if (added) {
@@ -119,14 +120,32 @@ fun addToPlaylist(playlistId: Long, song: SongItem, context: Context) {
         }
     }
     
-fun createPlaylistAndAddSong(playlistName: String, song: SongItem, context: Context) {        
+    fun createPlaylistAndAddSong(playlistName: String, song: SongItem, context: Context) {
         viewModelScope.launch {
-            musicRepository.createLocalPlaylist(playlistName)
-            // Get the new playlist and add song to it
-            musicRepository.getLocalPlaylists().first().firstOrNull { it.name == playlistName }?.let {
-                musicRepository.addSongToPlaylist(it.id, song)
-                Toast.makeText(context, "Created playlist and added song", Toast.LENGTH_SHORT).show()
-            }
+            val playlistId = musicRepository.createLocalPlaylist(playlistName)
+            musicRepository.addSongToPlaylist(playlistId, song)
+            Toast.makeText(context, "Created playlist and added song", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    fun saveRemotePlaylist(playlist: PlaylistItem, context: Context) {
+        viewModelScope.launch {
+            musicRepository.saveRemotePlaylist(playlist)
+                .onSuccess { addedSongs ->
+                    val message = if (addedSongs > 0) {
+                        "Saved ${playlist.title} ($addedSongs songs)"
+                    } else {
+                        "Playlist is already up to date"
+                    }
+                    Toast.makeText(context, message, Toast.LENGTH_SHORT).show()
+                }
+                .onFailure { error ->
+                    Toast.makeText(
+                        context,
+                        error.message ?: "Failed to save playlist",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                }
         }
     }
     

@@ -20,6 +20,7 @@ import com.beatloop.music.domain.recommendation.RecommendationContentRules
 import com.beatloop.music.domain.recommendation.RecommendationSource
 import com.google.gson.Gson
 import com.google.gson.JsonArray
+import com.google.gson.JsonElement
 import com.google.gson.JsonObject
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.RequestBody.Companion.toRequestBody
@@ -157,6 +158,9 @@ class MusicRepository @Inject constructor(
         private const val PIPED_INSTANCE_CACHE_TTL_MS = 30 * 60 * 1000L
         private const val STRATEGY_TIMEOUT_MS = 10_000L
         private const val STRATEGY_TIMEOUT_SLOW_MS = 15_000L
+        private const val HOME_RECOMMENDATION_MIN_SIZE = 12
+        private const val HOME_YOUTUBE_FALLBACK_MAX_SEEDS = 4
+        private const val PLAYLIST_SAVE_MAX_PAGES = 20
         private val newPipeInitLock = Any()
 
         @Volatile
@@ -440,10 +444,30 @@ class MusicRepository @Inject constructor(
                     limit = 30
                 )
 
+            val recommendationSeedSongs = (filteredRecentSongs + filteredSeedSongs + filteredQuickPicks + filteredOnboardingSongs)
+                .filter { song -> song.id.isNotBlank() }
+                .distinctBy { song -> song.id }
+
+            val youtubeFallbackRecommendations = if (personalized.size < HOME_RECOMMENDATION_MIN_SIZE) {
+                fetchYouTubeFallbackRecommendations(
+                    seedSongs = recommendationSeedSongs,
+                    activeLanguages = activeLanguages,
+                    excludedSongIds = recommendationCandidates.map { candidate -> candidate.song.id }.toSet()
+                )
+            } else {
+                emptyList()
+            }
+
+            val personalizedWithFallback = (personalized + youtubeFallbackRecommendations)
+                .distinctBy { song -> song.id }
+                .take(30)
+
             val motivationMessage = when {
                 filteredOnboardingSongs.isNotEmpty() && preferenceProfile.singers.isNotEmpty() ->
                     "Recommendations tuned for ${preferenceProfile.singers.first()} and your selected vibe"
-                personalized.isNotEmpty() && weightedArtists.isNotEmpty() ->
+                personalizedWithFallback.isNotEmpty() && youtubeFallbackRecommendations.isNotEmpty() ->
+                    "Blended with YouTube recommendations for fresher picks"
+                personalizedWithFallback.isNotEmpty() && weightedArtists.isNotEmpty() ->
                     "Fresh picks based on your ${weightedArtists.first()} listening taste"
                 filteredRecentSongs.isNotEmpty() -> "Welcome back. Your recent vibe is ready."
                 activeLanguages.isNotEmpty() ->
@@ -451,8 +475,10 @@ class MusicRepository @Inject constructor(
                 else -> "Start listening to unlock a personalized feed."
             }
 
-            val personalizedPool = personalized.ifEmpty {
-                filteredOnboardingSongs.take(30).ifEmpty { filteredTrendingSongs.take(30) }
+            val personalizedPool = personalizedWithFallback.ifEmpty {
+                (youtubeFallbackRecommendations + filteredOnboardingSongs + filteredTrendingSongs)
+                    .distinctBy { song -> song.id }
+                    .take(30)
             }
 
             val diversifiedPool = diversifyRecommendations(
@@ -461,7 +487,7 @@ class MusicRepository @Inject constructor(
                 refreshNonce = refreshNonce
             )
 
-            val fallbackQuickPicks = (filteredOnboardingSongs + filteredQuickPicks)
+            val fallbackQuickPicks = (youtubeFallbackRecommendations + filteredOnboardingSongs + filteredQuickPicks)
                 .distinctBy { it.id }
                 .take(15)
 
@@ -637,6 +663,46 @@ class MusicRepository @Inject constructor(
         }
     }
 
+    private suspend fun fetchYouTubeFallbackRecommendations(
+        seedSongs: List<SongItem>,
+        activeLanguages: Set<String>,
+        excludedSongIds: Set<String>,
+        maxItems: Int = 30
+    ): List<SongItem> {
+        val seedIds = seedSongs
+            .asSequence()
+            .map { song -> song.id.trim() }
+            .filter { id ->
+                id.isNotBlank() &&
+                    !id.startsWith("content://") &&
+                    !id.startsWith("file://")
+            }
+            .distinct()
+            .take(HOME_YOUTUBE_FALLBACK_MAX_SEEDS)
+            .toList()
+
+        if (seedIds.isEmpty()) return emptyList()
+
+        val fallbackSongs = coroutineScope {
+            seedIds
+                .map { seedId ->
+                    async { getRelatedSongs(seedId).getOrDefault(emptyList()) }
+                }
+                .awaitAll()
+                .flatten()
+        }
+
+        return applyLanguageFilter(
+            songs = filterEligibleSongs(fallbackSongs)
+                .asSequence()
+                .filterNot { song -> excludedSongIds.contains(song.id) }
+                .distinctBy { song -> song.id }
+                .toList(),
+            activeLanguages = activeLanguages,
+            allowUnknownLanguage = true
+        ).take(maxItems)
+    }
+
     private suspend fun buildGenreSections(preferenceProfile: PreferenceProfile): List<GenreRecommendationSection> {
         val activeLanguages = preferenceProfile.activeLanguages
         val primaryLanguage = preferenceProfile.primaryLanguage ?: activeLanguages.firstOrNull()
@@ -696,7 +762,9 @@ class MusicRepository @Inject constructor(
     private fun filterEligibleSongs(songs: List<SongItem>): List<SongItem> {
         return songs
             .asSequence()
-            .filter { song -> song.id.isNotBlank() && RecommendationContentRules.isTrackAllowed(song) }
+            .filter { song ->
+                song.id.isNotBlank() && RecommendationContentRules.isRecommendationTrackAllowed(song)
+            }
             .distinctBy { song -> song.id }
             .toList()
     }
@@ -857,7 +925,7 @@ class MusicRepository @Inject constructor(
             artistId = artistId,
             thumbnailUrl = thumbnailUrl,
             albumId = albumId,
-            duration = duration,
+            duration = duration.takeIf { it > 0L },
             localPath = localPath
         )
     }
@@ -1935,6 +2003,391 @@ class MusicRepository @Inject constructor(
             Result.failure(e)
         }
     }
+
+    private fun collectRendererObjects(
+        element: JsonElement?,
+        rendererKey: String,
+        destination: MutableList<JsonObject>
+    ) {
+        if (element == null || element.isJsonNull) return
+
+        when {
+            element.isJsonObject -> {
+                val obj = element.asJsonObject
+
+                if (obj.has(rendererKey) && obj.get(rendererKey).isJsonObject) {
+                    destination.add(obj.getAsJsonObject(rendererKey))
+                }
+
+                obj.entrySet().forEach { (_, value) ->
+                    collectRendererObjects(value, rendererKey, destination)
+                }
+            }
+
+            element.isJsonArray -> {
+                element.asJsonArray.forEach { child ->
+                    collectRendererObjects(child, rendererKey, destination)
+                }
+            }
+        }
+    }
+
+    private fun readTextNode(node: JsonObject?): String? {
+        if (node == null) return null
+
+        val simpleText = node.get("simpleText")?.asString?.trim()
+        if (!simpleText.isNullOrBlank()) {
+            return simpleText
+        }
+
+        val runs = node.getAsJsonArray("runs")
+        if (runs != null && runs.size() > 0) {
+            val text = runs.joinToString(separator = "") { run ->
+                run.asJsonObject?.get("text")?.asString.orEmpty()
+            }.trim()
+            if (text.isNotBlank()) {
+                return text
+            }
+        }
+
+        return null
+    }
+
+    private fun extractThumbnailUrl(renderer: JsonObject): String? {
+        val direct = listOfNotNull(
+            renderer.getAsJsonObject("thumbnail")
+                ?.getAsJsonObject("musicThumbnailRenderer")
+                ?.getAsJsonObject("thumbnail")
+                ?.getAsJsonArray("thumbnails")
+                ?.lastOrNull()?.asJsonObject
+                ?.get("url")?.asString,
+            renderer.getAsJsonObject("thumbnailRenderer")
+                ?.getAsJsonObject("musicThumbnailRenderer")
+                ?.getAsJsonObject("thumbnail")
+                ?.getAsJsonArray("thumbnails")
+                ?.lastOrNull()?.asJsonObject
+                ?.get("url")?.asString,
+            renderer.getAsJsonObject("thumbnail")
+                ?.getAsJsonObject("croppedSquareThumbnailRenderer")
+                ?.getAsJsonObject("thumbnail")
+                ?.getAsJsonArray("thumbnails")
+                ?.lastOrNull()?.asJsonObject
+                ?.get("url")?.asString
+        ).firstOrNull { !it.isNullOrBlank() }
+
+        if (!direct.isNullOrBlank()) return direct
+
+        val musicThumbRenderers = mutableListOf<JsonObject>()
+        collectRendererObjects(renderer, "musicThumbnailRenderer", musicThumbRenderers)
+        musicThumbRenderers.firstNotNullOfOrNull { thumbRenderer ->
+            thumbRenderer.getAsJsonObject("thumbnail")
+                ?.getAsJsonArray("thumbnails")
+                ?.lastOrNull()?.asJsonObject
+                ?.get("url")?.asString
+                ?.takeIf { it.isNotBlank() }
+        }?.let { return it }
+
+        val croppedThumbRenderers = mutableListOf<JsonObject>()
+        collectRendererObjects(renderer, "croppedSquareThumbnailRenderer", croppedThumbRenderers)
+        return croppedThumbRenderers.firstNotNullOfOrNull { thumbRenderer ->
+            thumbRenderer.getAsJsonObject("thumbnail")
+                ?.getAsJsonArray("thumbnails")
+                ?.lastOrNull()?.asJsonObject
+                ?.get("url")?.asString
+                ?.takeIf { it.isNotBlank() }
+        }
+    }
+
+    private fun extractVideoIdFromRenderer(renderer: JsonObject): String? {
+        val directVideoId = renderer.getAsJsonObject("playlistItemData")
+            ?.get("videoId")?.asString
+            ?: renderer.getAsJsonObject("navigationEndpoint")
+                ?.getAsJsonObject("watchEndpoint")
+                ?.get("videoId")?.asString
+            ?: renderer.getAsJsonObject("overlay")
+                ?.getAsJsonObject("musicItemThumbnailOverlayRenderer")
+                ?.getAsJsonObject("content")
+                ?.getAsJsonObject("musicPlayButtonRenderer")
+                ?.getAsJsonObject("playNavigationEndpoint")
+                ?.getAsJsonObject("watchEndpoint")
+                ?.get("videoId")?.asString
+            ?: renderer.getAsJsonArray("flexColumns")
+                ?.firstOrNull()?.asJsonObject
+                ?.getAsJsonObject("musicResponsiveListItemFlexColumnRenderer")
+                ?.getAsJsonObject("text")
+                ?.getAsJsonArray("runs")
+                ?.firstOrNull()?.asJsonObject
+                ?.getAsJsonObject("navigationEndpoint")
+                ?.getAsJsonObject("watchEndpoint")
+                ?.get("videoId")?.asString
+
+        if (!directVideoId.isNullOrBlank()) {
+            return directVideoId
+        }
+
+        val watchEndpoints = mutableListOf<JsonObject>()
+        collectRendererObjects(renderer, "watchEndpoint", watchEndpoints)
+        return watchEndpoints.firstNotNullOfOrNull { endpoint ->
+            endpoint.get("videoId")?.asString?.takeIf { it.isNotBlank() }
+        }
+    }
+
+    private fun extractBrowseEndpointFromRenderer(renderer: JsonObject): JsonObject? {
+        renderer.getAsJsonObject("navigationEndpoint")
+            ?.getAsJsonObject("browseEndpoint")
+            ?.let { return it }
+
+        renderer.getAsJsonArray("flexColumns")
+            ?.firstOrNull()?.asJsonObject
+            ?.getAsJsonObject("musicResponsiveListItemFlexColumnRenderer")
+            ?.getAsJsonObject("text")
+            ?.getAsJsonArray("runs")
+            ?.firstOrNull()?.asJsonObject
+            ?.getAsJsonObject("navigationEndpoint")
+            ?.getAsJsonObject("browseEndpoint")
+            ?.let { return it }
+
+        val browseEndpoints = mutableListOf<JsonObject>()
+        collectRendererObjects(renderer, "browseEndpoint", browseEndpoints)
+        return browseEndpoints.firstOrNull { endpoint ->
+            endpoint.get("browseId")?.asString?.isNotBlank() == true
+        }
+    }
+
+    private fun extractMusicPageType(browseEndpoint: JsonObject?): String? {
+        return browseEndpoint
+            ?.getAsJsonObject("browseEndpointContextSupportedConfigs")
+            ?.getAsJsonObject("browseEndpointContextMusicConfig")
+            ?.get("pageType")?.asString
+    }
+
+    private fun extractResponsiveTitle(renderer: JsonObject): String? {
+        val flexColumns = renderer.getAsJsonArray("flexColumns") ?: return null
+        if (flexColumns.size() == 0) return null
+
+        return flexColumns
+            .firstOrNull()?.asJsonObject
+            ?.getAsJsonObject("musicResponsiveListItemFlexColumnRenderer")
+            ?.getAsJsonObject("text")
+            ?.let { readTextNode(it) }
+            ?.trim()
+            ?.takeIf { it.isNotBlank() }
+    }
+
+    private fun extractResponsiveArtistText(renderer: JsonObject): String {
+        val flexColumns = renderer.getAsJsonArray("flexColumns") ?: return ""
+        if (flexColumns.size() <= 1) return ""
+
+        val parts = mutableListOf<String>()
+        for (index in 1 until flexColumns.size()) {
+            val text = flexColumns.get(index)?.asJsonObject
+                ?.getAsJsonObject("musicResponsiveListItemFlexColumnRenderer")
+                ?.getAsJsonObject("text")
+                ?.let { readTextNode(it) }
+                ?.trim()
+                .orEmpty()
+            if (text.isNotBlank()) {
+                parts.add(text)
+            }
+        }
+
+        return parts.joinToString(" • ")
+    }
+
+    private fun extractRendererTitle(renderer: JsonObject): String? {
+        return extractResponsiveTitle(renderer)
+            ?: readTextNode(renderer.getAsJsonObject("title"))
+            ?: readTextNode(renderer.getAsJsonObject("text"))
+    }
+
+    private fun parseResponsiveSongItem(renderer: JsonObject): SongItem? {
+        val videoId = extractVideoIdFromRenderer(renderer) ?: return null
+        val title = extractResponsiveTitle(renderer) ?: return null
+        val artistsText = extractResponsiveArtistText(renderer)
+        val durationMs = parseDurationFromFixedColumns(renderer.getAsJsonArray("fixedColumns"))
+            ?: parseDurationMs(artistsText)
+            ?: parseDurationMs(title)
+
+        return createSongItemIfEligible(
+            id = videoId,
+            title = title,
+            artistsText = artistsText,
+            thumbnailUrl = extractThumbnailUrl(renderer),
+            durationMs = durationMs
+        )
+    }
+
+    private fun parseTwoRowSongItem(renderer: JsonObject): SongItem? {
+        val videoId = renderer.getAsJsonObject("navigationEndpoint")
+            ?.getAsJsonObject("watchEndpoint")
+            ?.get("videoId")?.asString
+            ?: extractVideoIdFromRenderer(renderer)
+            ?: return null
+
+        val title = readTextNode(renderer.getAsJsonObject("title")) ?: return null
+        val subtitle = readTextNode(renderer.getAsJsonObject("subtitle")).orEmpty()
+
+        return createSongItemIfEligible(
+            id = videoId,
+            title = title,
+            artistsText = subtitle,
+            thumbnailUrl = extractThumbnailUrl(renderer),
+            durationMs = parseDurationMs(subtitle) ?: parseDurationMs(title)
+        )
+    }
+
+    private fun parsePlaylistPanelSongItem(renderer: JsonObject): SongItem? {
+        val videoId = renderer.get("videoId")?.asString
+            ?: renderer.getAsJsonObject("navigationEndpoint")
+                ?.getAsJsonObject("watchEndpoint")
+                ?.get("videoId")?.asString
+            ?: return null
+
+        val title = readTextNode(renderer.getAsJsonObject("title")) ?: return null
+        val artistText = readTextNode(renderer.getAsJsonObject("shortBylineText"))
+            ?: readTextNode(renderer.getAsJsonObject("longBylineText"))
+            ?: ""
+        val lengthText = readTextNode(renderer.getAsJsonObject("lengthText"))
+        val thumbnailUrl = renderer.getAsJsonObject("thumbnail")
+            ?.getAsJsonArray("thumbnails")
+            ?.lastOrNull()?.asJsonObject
+            ?.get("url")?.asString
+
+        return createSongItemIfEligible(
+            id = videoId,
+            title = title,
+            artistsText = artistText,
+            thumbnailUrl = thumbnailUrl,
+            durationMs = parseDurationMs(lengthText ?: artistText)
+        )
+    }
+
+    private fun parseMoodGenreItem(renderer: JsonObject): MoodGenreItem? {
+        val title = readTextNode(renderer.getAsJsonObject("buttonText"))
+            ?: readTextNode(renderer.getAsJsonObject("title"))
+            ?: readTextNode(renderer.getAsJsonObject("text"))
+            ?: return null
+
+        val browseEndpoint = renderer.getAsJsonObject("clickCommand")
+            ?.getAsJsonObject("browseEndpoint")
+            ?: renderer.getAsJsonObject("navigationEndpoint")
+                ?.getAsJsonObject("browseEndpoint")
+            ?: return null
+
+        val params = browseEndpoint.get("params")?.asString?.trim().orEmpty()
+        if (params.isBlank()) return null
+
+        if (title.equals("More", ignoreCase = true) || title.equals("See all", ignoreCase = true)) {
+            return null
+        }
+
+        val browseId = browseEndpoint.get("browseId")?.asString.orEmpty()
+        if (browseId.isNotBlank()) {
+            val looksLikeMoodBrowse = browseId.contains("mood", ignoreCase = true) ||
+                browseId.contains("genre", ignoreCase = true) ||
+                browseId.contains("category", ignoreCase = true)
+
+            if (!looksLikeMoodBrowse) {
+                return null
+            }
+        }
+
+        val thumbnailUrl = extractThumbnailUrl(renderer)
+        val color = extractMoodGenreColor(renderer)
+        return MoodGenreItem(
+            title = title,
+            params = params,
+            thumbnailUrl = thumbnailUrl,
+            color = color
+        )
+    }
+
+    private fun extractMoodGenreColor(renderer: JsonObject): String? {
+        val solid = renderer.getAsJsonObject("solid")
+        val colorValue = listOf("leftStripeColor", "middleStripeColor", "rightStripeColor", "backgroundColor")
+            .firstNotNullOfOrNull { key ->
+                val node = solid?.get(key) ?: renderer.get(key)
+                when {
+                    node == null || node.isJsonNull -> null
+                    !node.isJsonPrimitive -> null
+                    node.asJsonPrimitive.isNumber -> node.asLong
+                    node.asJsonPrimitive.isString -> node.asString.toLongOrNull()
+                    else -> null
+                }
+            } ?: return null
+
+        val normalized = colorValue and 0xFFFFFFFFL
+        return String.format("#%08X", normalized)
+    }
+
+    private fun addMoodGenreItem(
+        item: MoodGenreItem,
+        moodsAndGenres: MutableList<MoodGenreItem>
+    ) {
+        val alreadyExists = moodsAndGenres.any { existing ->
+            existing.params == item.params || existing.title.equals(item.title, ignoreCase = true)
+        }
+        if (!alreadyExists) {
+            moodsAndGenres.add(item)
+        }
+    }
+
+    private fun parseBrowseCollectionItem(renderer: JsonObject): Any? {
+        val browseEndpoint = extractBrowseEndpointFromRenderer(renderer) ?: return null
+        val browseId = browseEndpoint.get("browseId")?.asString ?: return null
+        val pageType = extractMusicPageType(browseEndpoint)
+        val title = extractRendererTitle(renderer) ?: return null
+        val thumbnailUrl = extractThumbnailUrl(renderer)
+
+        return when (pageType) {
+            "MUSIC_PAGE_TYPE_ARTIST" -> ArtistItem(browseId, title, thumbnailUrl)
+            "MUSIC_PAGE_TYPE_ALBUM" -> AlbumItem(browseId, title, thumbnailUrl = thumbnailUrl)
+            "MUSIC_PAGE_TYPE_PLAYLIST" -> PlaylistItem(browseId, title, thumbnailUrl = thumbnailUrl)
+            else -> null
+        }
+    }
+
+    private fun extractHomeShelfTitle(shelf: JsonObject): String {
+        return shelf.getAsJsonObject("header")
+            ?.getAsJsonObject("musicCarouselShelfBasicHeaderRenderer")
+            ?.getAsJsonObject("title")
+            ?.let { readTextNode(it) }
+            ?: shelf.getAsJsonObject("header")
+                ?.getAsJsonObject("musicResponsiveHeaderRenderer")
+                ?.getAsJsonObject("title")
+                ?.let { readTextNode(it) }
+            ?: shelf.getAsJsonObject("title")
+                ?.let { readTextNode(it) }
+            ?: ""
+    }
+
+    private fun addHomeSong(
+        song: SongItem,
+        shelfTitleLower: String,
+        quickPicks: MutableList<SongItem>,
+        trendingSongs: MutableList<SongItem>
+    ) {
+        if (quickPicks.any { it.id == song.id } || trendingSongs.any { it.id == song.id }) {
+            return
+        }
+
+        val isTrendingShelf = shelfTitleLower.contains("trend") ||
+            shelfTitleLower.contains("chart") ||
+            shelfTitleLower.contains("top") ||
+            shelfTitleLower.contains("hot")
+
+        val isQuickPickShelf = shelfTitleLower.contains("quick") ||
+            shelfTitleLower.contains("listen again") ||
+            shelfTitleLower.contains("for you") ||
+            shelfTitleLower.contains("recommended") ||
+            shelfTitleLower.contains("because")
+
+        when {
+            isTrendingShelf -> trendingSongs.add(song)
+            isQuickPickShelf || quickPicks.size < 20 -> quickPicks.add(song)
+            else -> trendingSongs.add(song)
+        }
+    }
     
     fun getSearchHistory(): Flow<List<SearchHistory>> = searchHistoryDao.getSearchHistory()
     
@@ -2012,71 +2465,13 @@ class MusicRepository @Inject constructor(
     
     private fun parseMusicItem(item: JsonObject): Any? {
         return try {
-            val flexColumns = item.getAsJsonArray("flexColumns")
-            val fixedColumns = item.getAsJsonArray("fixedColumns")
-            
-            if (flexColumns == null || flexColumns.size() == 0) return null
-            
-            val titleRuns = flexColumns[0].asJsonObject
-                .getAsJsonObject("musicResponsiveListItemFlexColumnRenderer")
-                ?.getAsJsonObject("text")
-                ?.getAsJsonArray("runs")
-            
-            val title = titleRuns?.firstOrNull()?.asJsonObject?.get("text")?.asString ?: return null
-            
-            val navigationEndpoint = titleRuns?.firstOrNull()?.asJsonObject
-                ?.getAsJsonObject("navigationEndpoint")
-            
-            val watchEndpoint = navigationEndpoint?.getAsJsonObject("watchEndpoint")
-            val browseEndpoint = navigationEndpoint?.getAsJsonObject("browseEndpoint")
-            
-            if (watchEndpoint != null) {
-                val videoId = watchEndpoint.get("videoId")?.asString ?: return null
-                val durationMs = parseDurationFromFixedColumns(fixedColumns)
-                
-                val artistsText = if (flexColumns.size() > 1) {
-                    flexColumns[1].asJsonObject
-                        .getAsJsonObject("musicResponsiveListItemFlexColumnRenderer")
-                        ?.getAsJsonObject("text")
-                        ?.getAsJsonArray("runs")
-                        ?.firstOrNull()?.asJsonObject
-                        ?.get("text")?.asString ?: "Unknown Artist"
-                } else "Unknown Artist"
-                
-                val thumbnailUrl = item.getAsJsonObject("thumbnail")
-                    ?.getAsJsonObject("musicThumbnailRenderer")
-                    ?.getAsJsonObject("thumbnail")
-                    ?.getAsJsonArray("thumbnails")
-                    ?.lastOrNull()?.asJsonObject
-                    ?.get("url")?.asString
-
-                createSongItemIfEligible(
-                    id = videoId,
-                    title = title,
-                    artistsText = artistsText,
-                    thumbnailUrl = thumbnailUrl,
-                    durationMs = durationMs
-                )
-            } else if (browseEndpoint != null) {
-                val browseId = browseEndpoint.get("browseId")?.asString ?: return null
-                val pageType = browseEndpoint.getAsJsonObject("browseEndpointContextSupportedConfigs")
-                    ?.getAsJsonObject("browseEndpointContextMusicConfig")
-                    ?.get("pageType")?.asString
-                
-                val thumbnailUrl = item.getAsJsonObject("thumbnail")
-                    ?.getAsJsonObject("musicThumbnailRenderer")
-                    ?.getAsJsonObject("thumbnail")
-                    ?.getAsJsonArray("thumbnails")
-                    ?.lastOrNull()?.asJsonObject
-                    ?.get("url")?.asString
-                
-                when (pageType) {
-                    "MUSIC_PAGE_TYPE_ARTIST" -> ArtistItem(browseId, title, thumbnailUrl)
-                    "MUSIC_PAGE_TYPE_ALBUM" -> AlbumItem(browseId, title, thumbnailUrl = thumbnailUrl)
-                    "MUSIC_PAGE_TYPE_PLAYLIST" -> PlaylistItem(browseId, title, thumbnailUrl = thumbnailUrl)
-                    else -> null
-                }
-            } else null
+            if (item.has("flexColumns")) {
+                parseResponsiveSongItem(item)
+                    ?: parseBrowseCollectionItem(item)
+            } else {
+                parseTwoRowSongItem(item)
+                    ?: parseBrowseCollectionItem(item)
+            }
         } catch (e: Exception) {
             null
         }
@@ -2117,21 +2512,59 @@ class MusicRepository @Inject constructor(
         val moodsAndGenres = mutableListOf<MoodGenreItem>()
         
         try {
-            val contents = response.getAsJsonObject("contents")
+            val tabContent = response.getAsJsonObject("contents")
                 ?.getAsJsonObject("singleColumnBrowseResultsRenderer")
                 ?.getAsJsonArray("tabs")
                 ?.firstOrNull()?.asJsonObject
                 ?.getAsJsonObject("tabRenderer")
                 ?.getAsJsonObject("content")
-                ?.getAsJsonObject("sectionListRenderer")
-                ?.getAsJsonArray("contents")
-            
-            contents?.forEach { section ->
-                val shelf = section.asJsonObject
-                    .getAsJsonObject("musicCarouselShelfRenderer")
-                    ?: section.asJsonObject.getAsJsonObject("musicImmersiveCarouselShelfRenderer")
-                
-                shelf?.let { parseHomeShelf(it, quickPicks, trendingSongs, newReleases, recommendedPlaylists) }
+
+            val shelves = mutableListOf<JsonObject>()
+            collectRendererObjects(tabContent, "musicCarouselShelfRenderer", shelves)
+            collectRendererObjects(tabContent, "musicImmersiveCarouselShelfRenderer", shelves)
+            collectRendererObjects(tabContent, "musicShelfRenderer", shelves)
+
+            shelves.forEach { shelf ->
+                parseHomeShelf(
+                    shelf = shelf,
+                    quickPicks = quickPicks,
+                    trendingSongs = trendingSongs,
+                    newReleases = newReleases,
+                    recommendedPlaylists = recommendedPlaylists,
+                    moodsAndGenres = moodsAndGenres
+                )
+            }
+
+            if (quickPicks.isEmpty() && trendingSongs.isEmpty()) {
+                val responsiveRenderers = mutableListOf<JsonObject>()
+                collectRendererObjects(tabContent, "musicResponsiveListItemRenderer", responsiveRenderers)
+                responsiveRenderers.forEach { renderer ->
+                    parseResponsiveSongItem(renderer)?.let { song ->
+                        if (quickPicks.none { it.id == song.id }) {
+                            quickPicks.add(song)
+                        }
+                    }
+                }
+
+                val twoRowRenderers = mutableListOf<JsonObject>()
+                collectRendererObjects(tabContent, "musicTwoRowItemRenderer", twoRowRenderers)
+                twoRowRenderers.forEach { renderer ->
+                    parseTwoRowSongItem(renderer)?.let { song ->
+                        if (quickPicks.none { it.id == song.id }) {
+                            quickPicks.add(song)
+                        }
+                    }
+                }
+            }
+
+            if (moodsAndGenres.isEmpty()) {
+                val navigationButtons = mutableListOf<JsonObject>()
+                collectRendererObjects(tabContent, "musicNavigationButtonRenderer", navigationButtons)
+                navigationButtons.forEach { renderer ->
+                    parseMoodGenreItem(renderer)?.let { moodItem ->
+                        addMoodGenreItem(moodItem, moodsAndGenres)
+                    }
+                }
             }
         } catch (e: Exception) {
             e.printStackTrace()
@@ -2154,154 +2587,67 @@ class MusicRepository @Inject constructor(
         quickPicks: MutableList<SongItem>,
         trendingSongs: MutableList<SongItem>,
         newReleases: MutableList<AlbumItem>,
-        recommendedPlaylists: MutableList<PlaylistItem>
+        recommendedPlaylists: MutableList<PlaylistItem>,
+        moodsAndGenres: MutableList<MoodGenreItem>
     ) {
-        // Get the shelf title to determine the type
-        val shelfTitle = shelf.getAsJsonObject("header")
-            ?.getAsJsonObject("musicCarouselShelfBasicHeaderRenderer")
-            ?.getAsJsonObject("title")
-            ?.getAsJsonArray("runs")
-            ?.firstOrNull()?.asJsonObject
-            ?.get("text")?.asString?.lowercase() ?: ""
-        
+        val shelfTitle = extractHomeShelfTitle(shelf).lowercase()
+        val isMoodShelf = shelfTitle.contains("mood") ||
+            shelfTitle.contains("genre") ||
+            shelfTitle.contains("feel")
         val contents = shelf.getAsJsonArray("contents")
-        
+
         contents?.forEach { item ->
-            val itemObj = item.asJsonObject
-            val twoRowItem = itemObj.getAsJsonObject("musicTwoRowItemRenderer")
-            val responsiveItem = itemObj.getAsJsonObject("musicResponsiveListItemRenderer")
-            
-            // Parse musicResponsiveListItemRenderer (used for Quick picks, Listen again, etc.)
-            responsiveItem?.let { responsive ->
-                // Get video ID from overlay or navigation endpoint
-                val videoId = responsive.getAsJsonObject("overlay")
-                    ?.getAsJsonObject("musicItemThumbnailOverlayRenderer")
-                    ?.getAsJsonObject("content")
-                    ?.getAsJsonObject("musicPlayButtonRenderer")
-                    ?.getAsJsonObject("playNavigationEndpoint")
-                    ?.getAsJsonObject("watchEndpoint")
-                    ?.get("videoId")?.asString
-                    ?: responsive.getAsJsonArray("flexColumns")
-                        ?.firstOrNull()?.asJsonObject
-                        ?.getAsJsonObject("musicResponsiveListItemFlexColumnRenderer")
-                        ?.getAsJsonObject("text")
-                        ?.getAsJsonArray("runs")
-                        ?.firstOrNull()?.asJsonObject
-                        ?.getAsJsonObject("navigationEndpoint")
-                        ?.getAsJsonObject("watchEndpoint")
-                        ?.get("videoId")?.asString
-                
-                if (videoId != null) {
-                    // Get title from flexColumns
-                    val title = responsive.getAsJsonArray("flexColumns")
-                        ?.firstOrNull()?.asJsonObject
-                        ?.getAsJsonObject("musicResponsiveListItemFlexColumnRenderer")
-                        ?.getAsJsonObject("text")
-                        ?.getAsJsonArray("runs")
-                        ?.firstOrNull()?.asJsonObject
-                        ?.get("text")?.asString ?: "Unknown"
-                    
-                    // Get artist from second flex column
-                    val flexColumns = responsive.getAsJsonArray("flexColumns")
-                    val artistText = if (flexColumns != null && flexColumns.size() > 1) {
-                        val artistRuns = flexColumns.get(1)?.asJsonObject
-                            ?.getAsJsonObject("musicResponsiveListItemFlexColumnRenderer")
-                            ?.getAsJsonObject("text")
-                            ?.getAsJsonArray("runs")
-                        val sb = StringBuilder()
-                        artistRuns?.forEach { run ->
-                            sb.append(run.asJsonObject?.get("text")?.asString ?: "")
+            if (isMoodShelf) {
+                val navigationButtons = mutableListOf<JsonObject>()
+                collectRendererObjects(item, "musicNavigationButtonRenderer", navigationButtons)
+                navigationButtons.forEach { renderer ->
+                    parseMoodGenreItem(renderer)?.let { moodItem ->
+                        addMoodGenreItem(moodItem, moodsAndGenres)
+                    }
+                }
+            }
+
+            val responsiveItems = mutableListOf<JsonObject>()
+            collectRendererObjects(item, "musicResponsiveListItemRenderer", responsiveItems)
+
+            responsiveItems.forEach { responsive ->
+                parseResponsiveSongItem(responsive)?.let { song ->
+                    addHomeSong(song, shelfTitle, quickPicks, trendingSongs)
+                }
+
+                when (val parsed = parseBrowseCollectionItem(responsive)) {
+                    is AlbumItem -> {
+                        if (newReleases.none { it.id == parsed.id }) {
+                            newReleases.add(parsed)
                         }
-                        sb.toString()
-                    } else ""
-                    
-                    // Get thumbnail
-                    val thumbnailUrl = responsive.getAsJsonObject("thumbnail")
-                        ?.getAsJsonObject("musicThumbnailRenderer")
-                        ?.getAsJsonObject("thumbnail")
-                        ?.getAsJsonArray("thumbnails")
-                        ?.lastOrNull()?.asJsonObject
-                        ?.get("url")?.asString
-                    
-                    val song = createSongItemIfEligible(
-                        id = videoId,
-                        title = title,
-                        artistsText = artistText,
-                        thumbnailUrl = thumbnailUrl,
-                        durationMs = parseDurationMs(artistText)
-                    )
-                    
-                    // Add to quick picks or trending based on shelf title or size
-                    if (song != null) {
-                        if (shelfTitle.contains("quick") || shelfTitle.contains("listen again") || quickPicks.size < 15) {
-                            if (quickPicks.none { it.id == videoId }) quickPicks.add(song)
-                        } else {
-                            if (trendingSongs.none { it.id == videoId }) trendingSongs.add(song)
+                    }
+
+                    is PlaylistItem -> {
+                        if (recommendedPlaylists.none { it.id == parsed.id }) {
+                            recommendedPlaylists.add(parsed)
                         }
                     }
                 }
             }
-            
-            if (twoRowItem != null) {
-                val twoRow = twoRowItem
-                val title = twoRow.getAsJsonObject("title")
-                    ?.getAsJsonArray("runs")
-                    ?.firstOrNull()?.asJsonObject
-                    ?.get("text")?.asString ?: return@forEach
 
-                val navigationEndpoint = twoRow.getAsJsonObject("navigationEndpoint")
-                val watchEndpoint = navigationEndpoint?.getAsJsonObject("watchEndpoint")
-                val browseEndpoint = navigationEndpoint?.getAsJsonObject("browseEndpoint")
+            val twoRowItems = mutableListOf<JsonObject>()
+            collectRendererObjects(item, "musicTwoRowItemRenderer", twoRowItems)
 
-                val thumbnailUrl = twoRow.getAsJsonObject("thumbnailRenderer")
-                    ?.getAsJsonObject("musicThumbnailRenderer")
-                    ?.getAsJsonObject("thumbnail")
-                    ?.getAsJsonArray("thumbnails")
-                    ?.lastOrNull()?.asJsonObject
-                    ?.get("url")?.asString
+            twoRowItems.forEach { twoRow ->
+                parseTwoRowSongItem(twoRow)?.let { song ->
+                    addHomeSong(song, shelfTitle, quickPicks, trendingSongs)
+                }
 
-                if (watchEndpoint != null) {
-                    val videoId = watchEndpoint.get("videoId")?.asString ?: return@forEach
-                    val subtitle = twoRow.getAsJsonObject("subtitle")
-                        ?.getAsJsonArray("runs")
-                        ?.firstOrNull()?.asJsonObject
-                        ?.get("text")?.asString ?: ""
-
-                    val song = createSongItemIfEligible(
-                        id = videoId,
-                        title = title,
-                        artistsText = subtitle,
-                        thumbnailUrl = thumbnailUrl,
-                        durationMs = parseDurationMs(subtitle)
-                    )
-
-                    if (song != null) {
-                        if (shelfTitle.contains("trending") || shelfTitle.contains("charts")) {
-                            if (trendingSongs.none { it.id == videoId }) trendingSongs.add(song)
-                        } else if (quickPicks.size < 20) {
-                            if (quickPicks.none { it.id == videoId }) quickPicks.add(song)
-                        } else {
-                            if (trendingSongs.none { it.id == videoId }) trendingSongs.add(song)
+                when (val parsed = parseBrowseCollectionItem(twoRow)) {
+                    is AlbumItem -> {
+                        if (newReleases.none { it.id == parsed.id }) {
+                            newReleases.add(parsed)
                         }
                     }
 
-                } else if (browseEndpoint != null) {
-                    val browseId = browseEndpoint.get("browseId")?.asString ?: return@forEach
-                    val pageType = browseEndpoint.getAsJsonObject("browseEndpointContextSupportedConfigs")
-                        ?.getAsJsonObject("browseEndpointContextMusicConfig")
-                        ?.get("pageType")?.asString
-
-                    when (pageType) {
-                        "MUSIC_PAGE_TYPE_ALBUM" -> {
-                            if (newReleases.none { it.id == browseId }) {
-                                newReleases.add(AlbumItem(browseId, title, thumbnailUrl = thumbnailUrl))
-                            }
-                        }
-
-                        "MUSIC_PAGE_TYPE_PLAYLIST" -> {
-                            if (recommendedPlaylists.none { it.id == browseId }) {
-                                recommendedPlaylists.add(PlaylistItem(browseId, title, thumbnailUrl = thumbnailUrl))
-                            }
+                    is PlaylistItem -> {
+                        if (recommendedPlaylists.none { it.id == parsed.id }) {
+                            recommendedPlaylists.add(parsed)
                         }
                     }
                 }
@@ -2607,93 +2953,56 @@ class MusicRepository @Inject constructor(
                     ?.getAsJsonObject("header")
                     ?.getAsJsonObject("musicDetailHeaderRenderer")
             
-            playlistTitle = header?.getAsJsonObject("title")
-                ?.getAsJsonArray("runs")
-                ?.firstOrNull()?.asJsonObject
-                ?.get("text")?.asString ?: "Unknown Playlist"
-            
-            author = header?.getAsJsonObject("subtitle")
-                ?.getAsJsonArray("runs")
-                ?.firstOrNull()?.asJsonObject
-                ?.get("text")?.asString
-            
-            thumbnailUrl = header?.getAsJsonObject("thumbnail")
-                ?.getAsJsonObject("croppedSquareThumbnailRenderer")
-                ?.getAsJsonObject("thumbnail")
-                ?.getAsJsonArray("thumbnails")
-                ?.lastOrNull()?.asJsonObject
-                ?.get("url")?.asString
-            
-            description = header?.getAsJsonObject("description")
-                ?.getAsJsonArray("runs")
-                ?.firstOrNull()?.asJsonObject
-                ?.get("text")?.asString
-            
-            val contents = response.getAsJsonObject("contents")
-                ?.getAsJsonObject("singleColumnBrowseResultsRenderer")
-                ?.getAsJsonArray("tabs")
-                ?.firstOrNull()?.asJsonObject
-                ?.getAsJsonObject("tabRenderer")
-                ?.getAsJsonObject("content")
-                ?.getAsJsonObject("sectionListRenderer")
-                ?.getAsJsonArray("contents")
-                ?.firstOrNull()?.asJsonObject
-                ?.getAsJsonObject("musicPlaylistShelfRenderer")
-                ?: response.getAsJsonObject("contents")
-                    ?.getAsJsonObject("singleColumnBrowseResultsRenderer")
-                    ?.getAsJsonArray("tabs")
-                    ?.firstOrNull()?.asJsonObject
-                    ?.getAsJsonObject("tabRenderer")
-                    ?.getAsJsonObject("content")
-                    ?.getAsJsonObject("sectionListRenderer")
-                    ?.getAsJsonArray("contents")
-                    ?.firstOrNull()?.asJsonObject
-                    ?.getAsJsonObject("musicShelfRenderer")
-            
-            contents?.getAsJsonArray("contents")?.forEach { item ->
-                val itemObj = item.asJsonObject.getAsJsonObject("musicResponsiveListItemRenderer")
-                    ?: return@forEach
-                
-                val flexColumns = itemObj.getAsJsonArray("flexColumns")
-                val songTitle = flexColumns?.firstOrNull()?.asJsonObject
-                    ?.getAsJsonObject("musicResponsiveListItemFlexColumnRenderer")
-                    ?.getAsJsonObject("text")
-                    ?.getAsJsonArray("runs")
-                    ?.firstOrNull()?.asJsonObject
-                    ?.get("text")?.asString ?: return@forEach
-                
-                val artistText = if (flexColumns != null && flexColumns.size() > 1) {
-                    flexColumns.get(1)?.asJsonObject
-                    ?.getAsJsonObject("musicResponsiveListItemFlexColumnRenderer")
-                    ?.getAsJsonObject("text")
-                    ?.getAsJsonArray("runs")
-                    ?.firstOrNull()?.asJsonObject
-                    ?.get("text")?.asString ?: ""
-                } else ""
-                
-                val playlistItemData = itemObj.getAsJsonObject("playlistItemData")
-                val videoId = playlistItemData?.get("videoId")?.asString ?: return@forEach
-                
-                val songThumbnail = itemObj.getAsJsonObject("thumbnail")
-                    ?.getAsJsonObject("musicThumbnailRenderer")
-                    ?.getAsJsonObject("thumbnail")
-                    ?.getAsJsonArray("thumbnails")
-                    ?.lastOrNull()?.asJsonObject
-                    ?.get("url")?.asString
+                playlistTitle = readTextNode(header?.getAsJsonObject("title")) ?: "Unknown Playlist"
+                author = readTextNode(header?.getAsJsonObject("subtitle"))
+                thumbnailUrl = header?.let { extractThumbnailUrl(it) }
+                description = readTextNode(header?.getAsJsonObject("description"))
 
-                createSongItemIfEligible(
-                    id = videoId,
-                    title = songTitle,
-                    artistsText = artistText,
-                    thumbnailUrl = songThumbnail,
-                    durationMs = parseDurationMs(artistText)
-                )?.let { songs.add(it) }
-            }
-            
-            continuation = contents?.getAsJsonArray("continuations")
-                ?.firstOrNull()?.asJsonObject
-                ?.getAsJsonObject("nextContinuationData")
-                ?.get("continuation")?.asString
+                val playlistShelves = mutableListOf<JsonObject>()
+                collectRendererObjects(response, "musicPlaylistShelfRenderer", playlistShelves)
+
+                if (playlistShelves.isEmpty()) {
+                    collectRendererObjects(response, "musicShelfRenderer", playlistShelves)
+                }
+
+                val primaryShelf = playlistShelves
+                    .maxByOrNull { shelf -> shelf.getAsJsonArray("contents")?.size() ?: 0 }
+
+                primaryShelf?.getAsJsonArray("contents")?.forEach { item ->
+                    val responsiveItems = mutableListOf<JsonObject>()
+                    collectRendererObjects(item, "musicResponsiveListItemRenderer", responsiveItems)
+
+                    responsiveItems.forEach { renderer ->
+                        parseResponsiveSongItem(renderer)?.let { song ->
+                            if (songs.none { it.id == song.id }) {
+                                songs.add(song)
+                            }
+                        }
+                    }
+                }
+
+                if (songs.isEmpty()) {
+                    val panelSongs = mutableListOf<JsonObject>()
+                    collectRendererObjects(response, "playlistPanelVideoRenderer", panelSongs)
+                    panelSongs.forEach { renderer ->
+                        parsePlaylistPanelSongItem(renderer)?.let { song ->
+                            if (songs.none { it.id == song.id }) {
+                                songs.add(song)
+                            }
+                        }
+                    }
+                }
+
+                continuation = primaryShelf?.getAsJsonArray("continuations")
+                    ?.firstOrNull()?.asJsonObject
+                    ?.getAsJsonObject("nextContinuationData")
+                    ?.get("continuation")?.asString
+                    ?: response.getAsJsonObject("continuationContents")
+                        ?.getAsJsonObject("musicPlaylistShelfContinuation")
+                        ?.getAsJsonArray("continuations")
+                        ?.firstOrNull()?.asJsonObject
+                        ?.getAsJsonObject("nextContinuationData")
+                        ?.get("continuation")?.asString
                 
         } catch (e: Exception) {
             e.printStackTrace()
@@ -3066,63 +3375,48 @@ class MusicRepository @Inject constructor(
         val songs = mutableListOf<SongItem>()
         
         try {
-            val tabs = response.getAsJsonObject("contents")
-                ?.getAsJsonObject("singleColumnMusicWatchNextResultsRenderer")
-                ?.getAsJsonObject("tabbedRenderer")
-                ?.getAsJsonObject("watchNextTabbedResultsRenderer")
-                ?.getAsJsonArray("tabs")
-            
-            val contents = if (tabs != null && tabs.size() > 1) {
-                tabs.get(1)?.asJsonObject
-                    ?.getAsJsonObject("tabRenderer")
-                    ?.getAsJsonObject("content")
-                    ?.getAsJsonObject("musicQueueRenderer")
-                    ?.getAsJsonObject("content")
-                    ?.getAsJsonObject("playlistPanelRenderer")
-                    ?.getAsJsonArray("contents")
-            } else null
-            
-            contents?.forEach { item ->
-                val itemObj = item.asJsonObject.getAsJsonObject("playlistPanelVideoRenderer")
-                    ?: return@forEach
-                
-                val videoId = itemObj.get("videoId")?.asString ?: return@forEach
-                
-                val title = itemObj.getAsJsonObject("title")
-                    ?.getAsJsonArray("runs")
-                    ?.firstOrNull()?.asJsonObject
-                    ?.get("text")?.asString ?: return@forEach
-                
-                val artistText = itemObj.getAsJsonObject("shortBylineText")
-                    ?.getAsJsonArray("runs")
-                    ?.firstOrNull()?.asJsonObject
-                    ?.get("text")?.asString ?: ""
-                
-                val thumbnailUrl = itemObj.getAsJsonObject("thumbnail")
-                    ?.getAsJsonArray("thumbnails")
-                    ?.lastOrNull()?.asJsonObject
-                    ?.get("url")?.asString
+            val panelRenderers = mutableListOf<JsonObject>()
+            collectRendererObjects(response, "playlistPanelVideoRenderer", panelRenderers)
+            panelRenderers.forEach { renderer ->
+                parsePlaylistPanelSongItem(renderer)?.let { song ->
+                    if (songs.none { it.id == song.id }) {
+                        songs.add(song)
+                    }
+                }
+            }
 
-                val lengthText = itemObj.getAsJsonObject("lengthText")
-                    ?.getAsJsonArray("runs")
-                    ?.firstOrNull()?.asJsonObject
-                    ?.get("text")?.asString
-                    ?: itemObj.getAsJsonObject("lengthText")
-                        ?.get("simpleText")?.asString
+            if (songs.isEmpty()) {
+                val responsiveRenderers = mutableListOf<JsonObject>()
+                collectRendererObjects(response, "musicResponsiveListItemRenderer", responsiveRenderers)
+                responsiveRenderers.forEach { renderer ->
+                    parseResponsiveSongItem(renderer)?.let { song ->
+                        if (songs.none { it.id == song.id }) {
+                            songs.add(song)
+                        }
+                    }
+                }
+            }
 
-                createSongItemIfEligible(
-                    id = videoId,
-                    title = title,
-                    artistsText = artistText,
-                    thumbnailUrl = thumbnailUrl,
-                    durationMs = parseDurationMs(lengthText ?: title)
-                )?.let { songs.add(it) }
+            if (songs.isEmpty()) {
+                val twoRowRenderers = mutableListOf<JsonObject>()
+                collectRendererObjects(response, "musicTwoRowItemRenderer", twoRowRenderers)
+                twoRowRenderers.forEach { renderer ->
+                    parseTwoRowSongItem(renderer)?.let { song ->
+                        if (songs.none { it.id == song.id }) {
+                            songs.add(song)
+                        }
+                    }
+                }
             }
         } catch (e: Exception) {
             e.printStackTrace()
         }
-        
+
         return songs
+            .asSequence()
+            .filter { song -> RecommendationContentRules.isRecommendationTrackAllowed(song) }
+            .distinctBy { song -> song.id }
+            .toList()
     }
     
     private fun getGreeting(): String {
@@ -3171,13 +3465,100 @@ class MusicRepository @Inject constructor(
     // Local playlists
     fun getLocalPlaylists(): Flow<List<LocalPlaylist>> = songDao.getLocalPlaylists()
     
-    suspend fun createLocalPlaylist(name: String) {
-        songDao.createPlaylist(
+    suspend fun createLocalPlaylist(name: String): Long {
+        return songDao.createPlaylist(
             com.beatloop.music.data.database.PlaylistEntity(
                 name = name,
                 createdAt = System.currentTimeMillis()
             )
         )
+    }
+
+    suspend fun saveRemotePlaylist(playlist: PlaylistItem): Result<Int> = withContext(Dispatchers.IO) {
+        val playlistId = playlist.id.trim()
+        if (playlistId.isBlank()) {
+            return@withContext Result.failure(IllegalArgumentException("Invalid playlist id"))
+        }
+
+        val playlistPage = getPlaylist(playlistId).getOrElse { error ->
+            return@withContext Result.failure(error)
+        }
+
+        val songsToSave = collectPlaylistSongsForSave(
+            playlistId = playlistId,
+            playlistPage = playlistPage
+        )
+
+        if (songsToSave.isEmpty()) {
+            return@withContext Result.failure(IllegalStateException("Playlist has no songs to save"))
+        }
+
+        val targetName = playlistPage.playlist.title
+            .takeIf { it.isNotBlank() }
+            ?: playlist.title.takeIf { it.isNotBlank() }
+            ?: "Saved Playlist"
+
+        val existingPlaylist = getLocalPlaylists()
+            .first()
+            .firstOrNull { local -> local.name.equals(targetName, ignoreCase = true) }
+
+        val targetPlaylistId = existingPlaylist?.id ?: createLocalPlaylist(targetName)
+        var addedSongs = 0
+
+        songsToSave.forEach { song ->
+            if (addSongToPlaylist(targetPlaylistId, song)) {
+                addedSongs += 1
+            }
+        }
+
+        Result.success(addedSongs)
+    }
+
+    private suspend fun collectPlaylistSongsForSave(
+        playlistId: String,
+        playlistPage: PlaylistPage
+    ): List<SongItem> {
+        val songsById = LinkedHashMap<String, SongItem>()
+
+        fun addSongs(songs: List<SongItem>) {
+            songs.forEach { song ->
+                val id = song.id.trim()
+                if (id.isNotBlank() && !songsById.containsKey(id)) {
+                    songsById[id] = song
+                }
+            }
+        }
+
+        addSongs(playlistPage.songs)
+
+        var continuation = playlistPage.continuation
+        var pageCount = 0
+        while (!continuation.isNullOrBlank() && pageCount < PLAYLIST_SAVE_MAX_PAGES) {
+            val continuationResult = getPlaylistContinuation(playlistId, continuation)
+            continuationResult
+                .onSuccess { result ->
+                    addSongs(result.songs)
+                    continuation = result.continuation
+                }
+                .onFailure { error ->
+                    Log.w(
+                        TAG,
+                        "Failed to load playlist continuation while saving playlistId=$playlistId",
+                        error
+                    )
+                    continuation = null
+                }
+            pageCount += 1
+        }
+
+        if (!continuation.isNullOrBlank()) {
+            Log.w(
+                TAG,
+                "Playlist save hit continuation cap for playlistId=$playlistId (maxPages=$PLAYLIST_SAVE_MAX_PAGES)"
+            )
+        }
+
+        return songsById.values.toList()
     }
     
     suspend fun deleteLocalPlaylist(playlistId: Long) {
@@ -3200,7 +3581,7 @@ class MusicRepository @Inject constructor(
     fun getLocalPlaylistWithSongs(playlistId: Long): Flow<LocalPlaylistWithSongs?> = 
         songDao.getPlaylistWithSongs(playlistId)
     
-suspend fun addSongToPlaylist(playlistId: Long, songId: String): Boolean {
+    suspend fun addSongToPlaylist(playlistId: Long, songId: String): Boolean {
         val added = songDao.addSongToPlaylist(playlistId, songId)
         if (added) {
             runCatching {
@@ -3370,8 +3751,11 @@ suspend fun addSongToPlaylist(playlistId: Long, songId: String): Boolean {
         if (candidates.isEmpty()) return emptyList()
 
         val recommendationCandidates = candidates
-            .filter { it.id.isNotBlank() }
-            .distinctBy { it.id }
+            .asSequence()
+            .filter { song ->
+                song.id.isNotBlank() && RecommendationContentRules.isRecommendationTrackAllowed(song)
+            }
+            .distinctBy { song -> song.id }
             .map { song ->
                 RecommendationCandidate(
                     song = song,
@@ -3379,6 +3763,9 @@ suspend fun addSongToPlaylist(playlistId: Long, songId: String): Boolean {
                     sourceBoost = 6.0
                 )
             }
+            .toList()
+
+        if (recommendationCandidates.isEmpty()) return emptyList()
 
         return recommendationRepository.rankNextSongCandidates(
             seedSongId = seedSongId,

@@ -38,18 +38,17 @@ import com.beatloop.music.data.preferences.ThemeMode
 import com.google.common.util.concurrent.ListenableFuture
 import com.google.common.util.concurrent.MoreExecutors
 import dagger.hilt.android.AndroidEntryPoint
-import kotlinx.coroutines.launch
-import javax.inject.Inject
 
 @AndroidEntryPoint
 class MainActivity : ComponentActivity() {
     
     private var playerConnection by mutableStateOf<PlayerConnection?>(null)
-    private lateinit var controllerFuture: ListenableFuture<MediaController>
+    private var controllerFuture: ListenableFuture<MediaController>? = null
+    private var hasRequestedPermissions = false
     
     private val requestPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
-    ) { permissions ->
+    ) { _ ->
         // Handle permission results
     }
     
@@ -58,7 +57,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         
         enableEdgeToEdge()
-        requestPermissions()
+        requestMissingPermissionsOnce()
         
         setContent {
             val themeViewModel: AppThemeViewModel = hiltViewModel()
@@ -114,11 +113,22 @@ class MainActivity : ComponentActivity() {
     }
     
     private fun connectToMusicService() {
+        if (playerConnection != null) return
+        val existingFuture = controllerFuture
+        if (existingFuture != null && !existingFuture.isDone) return
+
         val sessionToken = SessionToken(this, ComponentName(this, MusicService::class.java))
-        controllerFuture = MediaController.Builder(this, sessionToken).buildAsync()
-        controllerFuture.addListener(
+        val future = MediaController.Builder(this, sessionToken).buildAsync()
+        controllerFuture = future
+
+        future.addListener(
             {
-                val controller = controllerFuture.get()
+                if (future.isCancelled) return@addListener
+                val controller = runCatching { future.get() }.getOrNull() ?: return@addListener
+                if (controllerFuture !== future) {
+                    controller.release()
+                    return@addListener
+                }
                 playerConnection = PlayerConnection(controller, lifecycleScope)
             },
             MoreExecutors.directExecutor()
@@ -126,13 +136,24 @@ class MainActivity : ComponentActivity() {
     }
     
     private fun releaseMediaController() {
-        if (::controllerFuture.isInitialized) {
-            MediaController.releaseFuture(controllerFuture)
-            playerConnection = null
+        playerConnection = null
+        controllerFuture?.let { future ->
+            MediaController.releaseFuture(future)
+            controllerFuture = null
         }
     }
     
-    private fun requestPermissions() {
+    private fun requestMissingPermissionsOnce() {
+        if (hasRequestedPermissions) return
+        hasRequestedPermissions = true
+
+        val permissions = missingRuntimePermissions()
+        if (permissions.isNotEmpty()) {
+            requestPermissionLauncher.launch(permissions)
+        }
+    }
+
+    private fun missingRuntimePermissions(): Array<String> {
         val permissions = mutableListOf<String>()
         
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -159,9 +180,7 @@ class MainActivity : ComponentActivity() {
                 permissions.add(Manifest.permission.READ_EXTERNAL_STORAGE)
             }
         }
-        
-        if (permissions.isNotEmpty()) {
-            requestPermissionLauncher.launch(permissions.toTypedArray())
-        }
+
+        return permissions.toTypedArray()
     }
 }

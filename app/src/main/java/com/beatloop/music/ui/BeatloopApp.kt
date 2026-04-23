@@ -33,6 +33,7 @@ import androidx.navigation.compose.rememberNavController
 import com.beatloop.music.ui.components.BottomNavigationBar
 import com.beatloop.music.ui.components.MiniPlayer
 import com.beatloop.music.ui.components.PremiumScreenBackground
+import com.beatloop.music.ui.navigation.BeatloopGraph
 import com.beatloop.music.ui.navigation.BeatloopNavHost
 import com.beatloop.music.ui.navigation.Screen
 import com.beatloop.music.ui.screens.PlayerScreen
@@ -55,9 +56,9 @@ fun BeatloopApp() {
     }
 
     val startDestination = if (onboardingCompleted) {
-        Screen.Home.route
+        BeatloopGraph.Main
     } else {
-        Screen.Onboarding.route
+        BeatloopGraph.Onboarding
     }
 
     val navController = rememberNavController()
@@ -174,7 +175,10 @@ fun BeatloopApp() {
                 animationSpec = tween(280)
             ) + fadeOut(animationSpec = tween(220))
         ) {
-            PlayerScreen(onDismiss = { showFullPlayer = false })
+            PlayerScreen(
+                navController = navController,
+                onDismiss = { showFullPlayer = false }
+            )
         }
     }
 }

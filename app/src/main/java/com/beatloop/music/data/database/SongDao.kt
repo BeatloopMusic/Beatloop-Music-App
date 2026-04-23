@@ -66,10 +66,18 @@ interface SongDao {
     )
     suspend fun incrementPlayCount(id: String, playedAt: Long = System.currentTimeMillis())
 
-    @Query("SELECT * FROM songs WHERE playCount > 0 AND isSynced = 0 ORDER BY lastUpdatedTimestamp ASC LIMIT :limit")
+        @Query(
+                """
+                SELECT * FROM songs
+                WHERE (playCount > 0 OR liked = 1 OR lastUpdatedTimestamp > createdAt)
+                    AND isSynced = 0
+                ORDER BY lastUpdatedTimestamp ASC
+                LIMIT :limit
+                """
+        )
     suspend fun getUnsyncedListeningSongs(limit: Int = 200): List<Song>
 
-    @Query("SELECT MAX(lastUpdatedTimestamp) FROM songs WHERE playCount > 0")
+        @Query("SELECT MAX(lastUpdatedTimestamp) FROM songs WHERE playCount > 0 OR liked = 1 OR lastUpdatedTimestamp > createdAt")
     suspend fun getLatestListeningUpdatedTimestamp(): Long?
 
     @Query("UPDATE songs SET isSynced = 1 WHERE id IN (:songIds)")
@@ -80,6 +88,12 @@ interface SongDao {
         UPDATE songs
         SET title = :title,
             artistsText = :artistsText,
+            artistId = :artistId,
+            albumId = :albumId,
+            duration = :duration,
+            thumbnailUrl = :thumbnailUrl,
+            liked = :liked,
+            likedAt = :likedAt,
             playCount = :playCount,
             lastPlayedAt = :lastPlayedAt,
             lastUpdatedTimestamp = :lastUpdatedTimestamp,
@@ -91,6 +105,12 @@ interface SongDao {
         songId: String,
         title: String,
         artistsText: String,
+        artistId: String?,
+        albumId: String?,
+        duration: Long,
+        thumbnailUrl: String?,
+        liked: Boolean,
+        likedAt: Long?,
         playCount: Int,
         lastPlayedAt: Long?,
         lastUpdatedTimestamp: Long,
@@ -135,11 +155,29 @@ interface SongDao {
     suspend fun cleanupUnusedSongs()
     
     // Like/Unlike methods for SongItem compatibility
-    @Query("UPDATE songs SET liked = 1, likedAt = :timestamp WHERE id = :songId")
+    @Query(
+        """
+        UPDATE songs
+        SET liked = 1,
+            likedAt = :timestamp,
+            lastUpdatedTimestamp = :timestamp,
+            isSynced = 0
+        WHERE id = :songId
+        """
+    )
     suspend fun likeSong(songId: String, timestamp: Long = System.currentTimeMillis())
     
-    @Query("UPDATE songs SET liked = 0, likedAt = NULL WHERE id = :songId")
-    suspend fun unlikeSong(songId: String)
+    @Query(
+        """
+        UPDATE songs
+        SET liked = 0,
+            likedAt = NULL,
+            lastUpdatedTimestamp = :timestamp,
+            isSynced = 0
+        WHERE id = :songId
+        """
+    )
+    suspend fun unlikeSong(songId: String, timestamp: Long = System.currentTimeMillis())
     
     @Query("SELECT liked FROM songs WHERE id = :songId")
     suspend fun isSongLiked(songId: String): Boolean

@@ -9,6 +9,7 @@ import coil.request.CachePolicy
 import com.beatloop.music.data.database.AlbumDao
 import com.beatloop.music.data.database.ArtistDao
 import com.beatloop.music.data.database.BeatloopDatabase
+import com.beatloop.music.data.database.LocalRecommendationDao
 import com.beatloop.music.data.database.PlayHistoryDao
 import com.beatloop.music.data.database.PlaylistDao
 import com.beatloop.music.data.database.RecommendationDao
@@ -66,6 +67,11 @@ object AppModule {
     @Provides
     @Singleton
     fun provideRecommendationDao(database: BeatloopDatabase): RecommendationDao = database.recommendationDao()
+
+    @Provides
+    @Singleton
+    fun provideLocalRecommendationDao(database: BeatloopDatabase): LocalRecommendationDao =
+        database.localRecommendationDao()
 
     @Provides
     @Singleton

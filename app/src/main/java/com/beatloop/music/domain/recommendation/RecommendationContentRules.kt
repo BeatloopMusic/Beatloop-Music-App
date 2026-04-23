@@ -266,12 +266,20 @@ object RecommendationContentRules {
         return durationMs == null || durationMs <= MAX_TRACK_DURATION_MS
     }
 
+    fun isRecommendationDurationAllowed(durationMs: Long?): Boolean {
+        return durationMs != null && durationMs > 0L && durationMs <= MAX_TRACK_DURATION_MS
+    }
+
     fun isTitleAllowed(title: String): Boolean {
         return !liveWordRegex.containsMatchIn(title)
     }
 
     fun isTrackAllowed(song: SongItem): Boolean {
         return isTitleAllowed(song.title) && isDurationAllowed(song.duration)
+    }
+
+    fun isRecommendationTrackAllowed(song: SongItem): Boolean {
+        return isTitleAllowed(song.title) && isRecommendationDurationAllowed(song.duration)
     }
 
     fun matchesAllowedLanguages(

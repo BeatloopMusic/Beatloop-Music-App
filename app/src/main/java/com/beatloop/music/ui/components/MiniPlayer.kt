@@ -7,6 +7,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.SkipNext
@@ -18,7 +19,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.unit.dp
 import coil.compose.AsyncImage
 import com.beatloop.music.ui.PlayerConnection
@@ -34,6 +37,7 @@ fun MiniPlayer(
     val currentMediaItem = connection.currentMediaItem ?: return
     val currentPosition by connection.currentPosition.collectAsState()
     val duration by connection.duration.collectAsState()
+    val haptics = LocalHapticFeedback.current
     
     val progress = if (duration > 0) {
         (currentPosition.toFloat() / duration.toFloat()).coerceIn(0f, 1f)
@@ -47,7 +51,10 @@ fun MiniPlayer(
     PremiumGlassSurface(
         modifier = modifier
             .fillMaxWidth()
-            .clickable(onClick = onClick),
+            .clickable {
+                haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                onClick()
+            },
         shape = RoundedCornerShape(20.dp),
         tonalElevation = 4.dp
     ) {
@@ -100,11 +107,21 @@ fun MiniPlayer(
                     )
                 }
 
+                Icon(
+                    imageVector = Icons.Default.KeyboardArrowUp,
+                    contentDescription = "Expand player",
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(end = 4.dp)
+                )
+
                 Row(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     FilledTonalIconButton(
-                        onClick = { connection.playPause() },
+                        onClick = {
+                            haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                            connection.playPause()
+                        },
                         modifier = Modifier.size(36.dp)
                     ) {
                         Icon(
@@ -115,7 +132,10 @@ fun MiniPlayer(
                     }
 
                     IconButton(
-                        onClick = { connection.seekToNext() },
+                        onClick = {
+                            haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                            connection.seekToNext()
+                        },
                         modifier = Modifier.size(36.dp)
                     ) {
                         Icon(

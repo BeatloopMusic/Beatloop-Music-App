@@ -23,6 +23,7 @@ import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import com.beatloop.music.playback.createMediaItem
 import com.beatloop.music.ui.LocalPlayerConnection
+import com.beatloop.music.ui.components.PremiumEmptyState
 import com.beatloop.music.ui.components.SongListItem
 import com.beatloop.music.ui.viewmodel.LibraryViewModel
 import com.beatloop.music.ui.viewmodel.SongActionsViewModel
@@ -62,36 +63,14 @@ fun DownloadsScreen(
         }
     ) { paddingValues ->
         if (downloads.isEmpty() && activeDownloads.isEmpty()) {
-            Box(
+            PremiumEmptyState(
+                title = "No downloads yet",
+                message = "Downloaded tracks and progress will show up here for quick offline access.",
                 modifier = Modifier
                     .fillMaxSize()
                     .padding(paddingValues),
-                contentAlignment = Alignment.Center
-            ) {
-                Column(
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.Center
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.Download,
-                        contentDescription = null,
-                        modifier = Modifier.size(64.dp),
-                        tint = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    Spacer(modifier = Modifier.height(16.dp))
-                    Text(
-                        text = "No downloads yet",
-                        style = MaterialTheme.typography.titleMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Text(
-                        text = "Downloaded songs will appear here",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-            }
+                icon = Icons.Default.Download
+            )
         } else {
             LazyColumn(
                 modifier = Modifier

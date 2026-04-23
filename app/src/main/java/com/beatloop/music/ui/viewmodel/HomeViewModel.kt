@@ -4,6 +4,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.beatloop.music.data.model.AlbumItem
 import com.beatloop.music.data.model.GenreRecommendationSection
+import com.beatloop.music.data.model.MoodGenreItem
 import com.beatloop.music.data.model.PlaylistItem
 import com.beatloop.music.data.model.SongItem
 import com.beatloop.music.domain.usecase.home.GetHomeContentUseCase
@@ -31,6 +32,7 @@ data class HomeUiState(
     val topArtists: List<String> = emptyList(),
     val trendingSongs: List<SongItem> = emptyList(),
     val genreSections: List<GenreRecommendationSection> = emptyList(),
+    val moodsAndGenres: List<MoodGenreItem> = emptyList(),
     val newReleases: List<AlbumItem> = emptyList(),
     val recommendedPlaylists: List<PlaylistItem> = emptyList(),
     val networkStatus: NetworkStatus = NetworkStatus.Available,
@@ -97,6 +99,7 @@ class HomeViewModel @Inject constructor(
             _uiState.value.recentlyPlayed.isNotEmpty() ||
             _uiState.value.trendingSongs.isNotEmpty() ||
             _uiState.value.genreSections.isNotEmpty() ||
+            _uiState.value.moodsAndGenres.isNotEmpty() ||
             _uiState.value.newReleases.isNotEmpty() ||
             _uiState.value.recommendedPlaylists.isNotEmpty()
 
@@ -133,6 +136,7 @@ class HomeViewModel @Inject constructor(
                             topArtists = homeContent.topArtists,
                             trendingSongs = homeContent.trendingSongs,
                             genreSections = homeContent.genreSections,
+                            moodsAndGenres = homeContent.moodsAndGenres,
                             newReleases = homeContent.newReleases,
                             recommendedPlaylists = homeContent.recommendedPlaylists
                         )
