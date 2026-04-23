@@ -1,10 +1,12 @@
 package com.beatloop.music.ui.screens
 import androidx.compose.animation.*
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -22,12 +24,15 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.toArgb
-import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -76,6 +81,7 @@ fun PlayerScreen(
     val shuffleModeEnabled by playerConnection?.shuffleModeEnabled?.collectAsState() ?: remember { mutableStateOf(false) }
     val currentQueueIndex by playerConnection?.currentQueueIndex?.collectAsState() ?: remember { mutableStateOf(0) }
     val currentMediaItem by playerConnection?.currentMediaItemFlow?.collectAsState() ?: remember { mutableStateOf(null) }
+    val playbackSpeed by playerConnection?.playbackSpeed?.collectAsState() ?: remember { mutableStateOf(1f) }
     
     val playlists by songActionsViewModel.playlists.collectAsState()
     val downloadUiStateMap by songActionsViewModel.downloadUiStateMap.collectAsState()
@@ -85,6 +91,7 @@ fun PlayerScreen(
     var showQueue by remember { mutableStateOf(false) }
     var activePanel by rememberSaveable { mutableStateOf("Visual") }
     var showSleepTimerDialog by remember { mutableStateOf(false) }
+    var showPlaybackSpeedDialog by remember { mutableStateOf(false) }
     var showAddToPlaylist by remember { mutableStateOf(false) }
     var showCreatePlaylist by remember { mutableStateOf(false) }
     var activeSleepTimerMinutes by rememberSaveable { mutableStateOf<Int?>(null) }
@@ -120,6 +127,7 @@ fun PlayerScreen(
 
     // Extract colors from album art
     val context = LocalContext.current
+    val haptics = LocalHapticFeedback.current
     val primaryColor = MaterialTheme.colorScheme.primary
     val artworkUrl = currentMediaItem?.mediaMetadata?.artworkUri?.toString().toHighResArtworkUrl()
     val dominantColor by produceState(
@@ -157,6 +165,25 @@ fun PlayerScreen(
     val isCurrentDownloaded = uiState.isDownloaded || currentDownloadUi?.state == DownloadState.DOWNLOADED
     val currentDownloadProgress = currentDownloadUi?.progress
     val currentFileSizeBytes = currentDownloadUi?.fileSizeBytes ?: uiState.downloadedFileSizeBytes
+    var isUserSeeking by remember { mutableStateOf(false) }
+    var sliderPosition by remember { mutableFloatStateOf(0f) }
+
+    LaunchedEffect(currentMediaItem?.mediaId, currentPosition, duration, isUserSeeking) {
+        if (!isUserSeeking) {
+            sliderPosition = if (duration > 0L) {
+                (currentPosition.toFloat() / duration.toFloat()).coerceIn(0f, 1f)
+            } else {
+                0f
+            }
+        }
+    }
+
+    fun navigateFromPlayer(route: String) {
+        navController?.navigate(route) {
+            launchSingleTop = true
+        }
+        onDismiss?.invoke()
+    }
 
     fun buildPlaybackMediaItem(videoMode: Boolean, quality: Int): MediaItem? {
         val item = currentMediaItem ?: return null
@@ -207,11 +234,28 @@ fun PlayerScreen(
         }
     }
 
-    LaunchedEffect(showQueue, activePanel) {
-        if (!showQueue && activePanel == "Queue") {
-            activePanel = "Visual"
-        }
+    val artworkScale by animateFloatAsState(
+        targetValue = if (isPlaying) 1f else 0.98f,
+        animationSpec = tween(durationMillis = 360),
+        label = "player_artwork_scale"
+    )
+
+    val playbackModeLabel = if (isVideoMode) {
+        "Video mode • ${preferredVideoQuality}p"
+    } else {
+        "Audio mode"
     }
+
+    val configuration = LocalConfiguration.current
+    val isCompactWidth = configuration.screenWidthDp < 360
+    val isCompactHeight = configuration.screenHeightDp < 700
+    val mediaPanelHorizontalPadding = if (isCompactWidth) 12.dp else 24.dp
+    val controlsHorizontalPadding = if (isCompactWidth) 12.dp else 16.dp
+    val controlsVerticalPadding = if (isCompactHeight) 8.dp else 10.dp
+    val sideControlButtonSize = if (isCompactWidth) 44.dp else 52.dp
+    val sideControlIconSize = if (isCompactWidth) 28.dp else 34.dp
+    val playButtonSize = if (isCompactWidth) 58.dp else 68.dp
+    val playIconSize = if (isCompactWidth) 30.dp else 36.dp
     
     Box(
         modifier = Modifier
@@ -271,14 +315,21 @@ fun PlayerScreen(
                         )
                     }
 
-                    Text(
-                        text = "Now Playing",
-                        style = MaterialTheme.typography.titleSmall,
-                        color = foregroundColor
-                    )
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Text(
+                            text = "Now Playing",
+                            style = MaterialTheme.typography.titleSmall,
+                            color = foregroundColor
+                        )
+                        Text(
+                            text = playbackModeLabel,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = mutedForegroundColor
+                        )
+                    }
 
                     IconButton(onClick = {
-                        activePanel = "Queue"
+                        haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                         showQueue = true
                     }) {
                         Icon(
@@ -291,17 +342,10 @@ fun PlayerScreen(
             }
 
             PremiumFilterChipRow(
-                items = listOf("Visual", "Lyrics", "Queue"),
+                items = listOf("Visual", "Lyrics"),
                 selectedItem = activePanel,
                 onItemSelected = { selected ->
-                    when (selected) {
-                        "Queue" -> {
-                            activePanel = "Queue"
-                            showQueue = true
-                        }
-
-                        else -> activePanel = selected
-                    }
+                    activePanel = selected
                 }
             )
 
@@ -309,14 +353,7 @@ fun PlayerScreen(
                 modifier = Modifier
                     .fillMaxWidth()
                     .weight(1f)
-                    .padding(horizontal = 32.dp)
-                    .pointerInput(Unit) {
-                        detectTapGestures(
-                            onTap = {
-                                activePanel = if (activePanel == "Lyrics") "Visual" else "Lyrics"
-                            }
-                        )
-                    },
+                    .padding(horizontal = mediaPanelHorizontalPadding, vertical = 8.dp),
                 contentAlignment = Alignment.Center
             ) {
                 AnimatedContent(
@@ -338,11 +375,12 @@ fun PlayerScreen(
                         )
                     } else {
                         if (isVideoMode) {
-                            Box(
+                            PremiumGlassSurface(
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .aspectRatio(16f / 9f)
-                                    .clip(RoundedCornerShape(18.dp))
+                                    .aspectRatio(16f / 9f),
+                                shape = RoundedCornerShape(20.dp),
+                                tonalElevation = 4.dp
                             ) {
                                 AndroidView(
                                     modifier = Modifier.fillMaxSize(),
@@ -364,7 +402,8 @@ fun PlayerScreen(
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .aspectRatio(1f)
-                                    .clip(RoundedCornerShape(24.dp)),
+                                    .scale(artworkScale)
+                                    .clip(RoundedCornerShape(28.dp)),
                                 contentScale = ContentScale.Crop
                             )
                         }
@@ -375,12 +414,17 @@ fun PlayerScreen(
             PremiumGlassSurface(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = 20.dp, vertical = 12.dp),
-                shape = RoundedCornerShape(24.dp),
+                    .padding(horizontal = controlsHorizontalPadding, vertical = controlsVerticalPadding)
+                    .navigationBarsPadding(),
+                shape = RoundedCornerShape(26.dp),
                 tonalElevation = 4.dp
             ) {
                 Column(
-                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 14.dp)
+                    modifier = Modifier.padding(
+                        horizontal = if (isCompactWidth) 12.dp else 16.dp,
+                        vertical = if (isCompactHeight) 10.dp else 14.dp
+                    ),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -432,8 +476,11 @@ fun PlayerScreen(
                             }
                         }
 
-                        IconButton(
-                            onClick = { viewModel.toggleLike(currentMediaItem?.mediaId ?: "") }
+                        FilledTonalIconButton(
+                            onClick = {
+                                haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                viewModel.toggleLike(currentMediaItem?.mediaId ?: "")
+                            }
                         ) {
                             Icon(
                                 imageVector = if (uiState.isLiked) Icons.Default.Favorite else Icons.Default.FavoriteBorder,
@@ -444,16 +491,20 @@ fun PlayerScreen(
                     }
 
                     if (uiState.videoVotes != null || uiState.isLoadingVideoVotes) {
-                        Spacer(modifier = Modifier.height(8.dp))
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(14.dp)
+                            horizontalArrangement = Arrangement.spacedBy(12.dp)
                         ) {
                             if (uiState.isLoadingVideoVotes) {
                                 CircularProgressIndicator(
-                                    modifier = Modifier.size(16.dp),
+                                    modifier = Modifier.size(14.dp),
                                     strokeWidth = 2.dp,
+                                    color = mutedForegroundColor
+                                )
+                                Text(
+                                    text = "Fetching video stats",
+                                    style = MaterialTheme.typography.labelMedium,
                                     color = mutedForegroundColor
                                 )
                             } else {
@@ -484,19 +535,7 @@ fun PlayerScreen(
                             }
                         }
                     }
-                }
-            }
 
-            PremiumGlassSurface(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 20.dp, vertical = 10.dp),
-                shape = RoundedCornerShape(28.dp),
-                tonalElevation = 4.dp
-            ) {
-                Column(
-                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 14.dp)
-                ) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween,
@@ -515,9 +554,20 @@ fun PlayerScreen(
                     }
 
                     Slider(
-                        value = if (duration > 0) currentPosition.toFloat() / duration else 0f,
+                        value = sliderPosition,
                         onValueChange = { value ->
-                            playerConnection?.seekTo((value * duration).toLong())
+                            isUserSeeking = true
+                            sliderPosition = value
+                        },
+                        onValueChangeFinished = {
+                            val targetPosition = if (duration > 0L) {
+                                (sliderPosition * duration.toFloat()).toLong()
+                            } else {
+                                0L
+                            }
+                            playerConnection?.seekTo(targetPosition)
+                            haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                            isUserSeeking = false
                         },
                         modifier = Modifier.padding(top = 2.dp),
                         colors = SliderDefaults.colors(
@@ -527,8 +577,6 @@ fun PlayerScreen(
                         )
                     )
 
-                    Spacer(modifier = Modifier.height(10.dp))
-
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -536,7 +584,10 @@ fun PlayerScreen(
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        IconButton(onClick = { playerConnection?.toggleShuffle() }) {
+                        IconButton(onClick = {
+                            haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                            playerConnection?.toggleShuffle()
+                        }) {
                             Icon(
                                 imageVector = Icons.Default.Shuffle,
                                 contentDescription = "Shuffle",
@@ -545,20 +596,26 @@ fun PlayerScreen(
                         }
 
                         IconButton(
-                            onClick = { playerConnection?.skipToPrevious() },
-                            modifier = Modifier.size(52.dp)
+                            onClick = {
+                                haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                playerConnection?.skipToPrevious()
+                            },
+                            modifier = Modifier.size(sideControlButtonSize)
                         ) {
                             Icon(
                                 imageVector = Icons.Default.SkipPrevious,
                                 contentDescription = "Previous",
                                 tint = foregroundColor,
-                                modifier = Modifier.size(34.dp)
+                                modifier = Modifier.size(sideControlIconSize)
                             )
                         }
 
                         FloatingActionButton(
-                            onClick = { playerConnection?.togglePlayPause() },
-                            modifier = Modifier.size(68.dp),
+                            onClick = {
+                                haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                playerConnection?.togglePlayPause()
+                            },
+                            modifier = Modifier.size(playButtonSize),
                             containerColor = accentColor,
                             contentColor = MaterialTheme.colorScheme.onPrimary,
                             shape = CircleShape
@@ -566,23 +623,29 @@ fun PlayerScreen(
                             Icon(
                                 imageVector = if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
                                 contentDescription = if (isPlaying) "Pause" else "Play",
-                                modifier = Modifier.size(36.dp)
+                                modifier = Modifier.size(playIconSize)
                             )
                         }
 
                         IconButton(
-                            onClick = { playerConnection?.skipToNext() },
-                            modifier = Modifier.size(52.dp)
+                            onClick = {
+                                haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                playerConnection?.skipToNext()
+                            },
+                            modifier = Modifier.size(sideControlButtonSize)
                         ) {
                             Icon(
                                 imageVector = Icons.Default.SkipNext,
                                 contentDescription = "Next",
                                 tint = foregroundColor,
-                                modifier = Modifier.size(34.dp)
+                                modifier = Modifier.size(sideControlIconSize)
                             )
                         }
 
-                        IconButton(onClick = { playerConnection?.cycleRepeatMode() }) {
+                        IconButton(onClick = {
+                            haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                            playerConnection?.cycleRepeatMode()
+                        }) {
                             Icon(
                                 imageVector = when (repeatMode) {
                                     Player.REPEAT_MODE_ONE -> Icons.Default.RepeatOne
@@ -597,112 +660,159 @@ fun PlayerScreen(
                             )
                         }
                     }
-                }
-            }
 
-            PremiumGlassSurface(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 20.dp, vertical = 8.dp)
-                    .navigationBarsPadding(),
-                shape = RoundedCornerShape(24.dp),
-                tonalElevation = 4.dp
-            ) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 10.dp, vertical = 6.dp),
-                    horizontalArrangement = Arrangement.SpaceEvenly
-                ) {
-                    IconButton(
-                        onClick = {
-                            activePanel = if (activePanel == "Lyrics") "Visual" else "Lyrics"
-                        }
+                    HorizontalDivider(
+                        modifier = Modifier.padding(horizontal = 8.dp),
+                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.1f)
+                    )
+
+                    LazyRow(
+                        modifier = Modifier.fillMaxWidth(),
+                        contentPadding = PaddingValues(horizontal = 2.dp),
+                        horizontalArrangement = Arrangement.spacedBy(if (isCompactWidth) 2.dp else 4.dp),
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Icon(
-                            imageVector = Icons.Default.Lyrics,
-                            contentDescription = "Lyrics",
-                            tint = if (activePanel == "Lyrics") accentColor else mutedForegroundColor
-                        )
-                    }
+                        item {
+                            IconButton(
+                                onClick = {
+                                    haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                    activePanel = if (activePanel == "Lyrics") "Visual" else "Lyrics"
+                                }
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Lyrics,
+                                    contentDescription = "Lyrics",
+                                    tint = if (activePanel == "Lyrics") accentColor else mutedForegroundColor
+                                )
+                            }
+                        }
 
-                    IconButton(onClick = { showSleepTimerDialog = true }) {
-                        Icon(
-                            imageVector = Icons.Default.Timer,
-                            contentDescription = "Sleep Timer",
-                            tint = if (activeSleepTimerMinutes != null) accentColor else mutedForegroundColor
-                        )
-                    }
+                        item {
+                            IconButton(onClick = {
+                                haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                showQueue = true
+                            }) {
+                                Icon(
+                                    imageVector = Icons.AutoMirrored.Filled.QueueMusic,
+                                    contentDescription = "Queue",
+                                    tint = mutedForegroundColor
+                                )
+                            }
+                        }
 
-                    IconButton(
-                        enabled = !isCurrentDownloaded && !isCurrentDownloading,
-                        onClick = {
-                            currentMediaItem?.let { item ->
-                                songActionsViewModel.downloadSong(
-                                    SongItem(
+                        item {
+                            IconButton(onClick = {
+                                haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                showSleepTimerDialog = true
+                            }) {
+                                Icon(
+                                    imageVector = Icons.Default.Timer,
+                                    contentDescription = "Sleep Timer",
+                                    tint = if (activeSleepTimerMinutes != null) accentColor else mutedForegroundColor
+                                )
+                            }
+                        }
+
+                        item {
+                            IconButton(onClick = {
+                                haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                showPlaybackSpeedDialog = true
+                            }) {
+                                Icon(
+                                    imageVector = Icons.AutoMirrored.Filled.VolumeUp,
+                                    contentDescription = "Playback speed",
+                                    tint = if ((playbackSpeed - 1f).absoluteValue < 0.01f) {
+                                        mutedForegroundColor
+                                    } else {
+                                        accentColor
+                                    }
+                                )
+                            }
+                        }
+
+                        item {
+                            IconButton(
+                                enabled = !isCurrentDownloaded && !isCurrentDownloading,
+                                onClick = {
+                                    haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                    currentMediaItem?.let { item ->
+                                        songActionsViewModel.downloadSong(
+                                            SongItem(
+                                                id = item.mediaId,
+                                                title = item.mediaMetadata.title?.toString() ?: "Unknown",
+                                                artistsText = item.mediaMetadata.artist?.toString() ?: "Unknown",
+                                                thumbnailUrl = item.mediaMetadata.artworkUri?.toString()
+                                            ),
+                                            downloadVideo = isVideoMode,
+                                            videoQuality = preferredVideoQuality
+                                        )
+                                        navigateFromPlayer(Screen.Downloads.route)
+                                    }
+                                }
+                            ) {
+                                Icon(
+                                    imageVector = if (isCurrentDownloaded) Icons.Default.DownloadDone else Icons.Default.Download,
+                                    contentDescription = "Download",
+                                    tint = when {
+                                        isCurrentDownloaded -> accentColor
+                                        isCurrentDownloading -> accentColor
+                                        else -> mutedForegroundColor
+                                    }
+                                )
+                            }
+                        }
+
+                        item {
+                            IconButton(onClick = {
+                                haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                showAddToPlaylist = true
+                            }) {
+                                Icon(
+                                    imageVector = Icons.AutoMirrored.Filled.PlaylistAdd,
+                                    contentDescription = "Add to Playlist",
+                                    tint = mutedForegroundColor
+                                )
+                            }
+                        }
+
+                        item {
+                            IconButton(onClick = {
+                                haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                currentMediaItem?.let { item ->
+                                    val song = SongItem(
                                         id = item.mediaId,
                                         title = item.mediaMetadata.title?.toString() ?: "Unknown",
                                         artistsText = item.mediaMetadata.artist?.toString() ?: "Unknown",
                                         thumbnailUrl = item.mediaMetadata.artworkUri?.toString()
-                                    ),
-                                    downloadVideo = isVideoMode,
-                                    videoQuality = preferredVideoQuality
+                                    )
+                                    context.startActivity(songActionsViewModel.createShareIntent(song))
+                                }
+                            }) {
+                                Icon(
+                                    imageVector = Icons.Default.Share,
+                                    contentDescription = "Share",
+                                    tint = mutedForegroundColor
                                 )
-                                navController?.navigate(Screen.Downloads.route)
-                                onDismiss?.invoke()
                             }
                         }
-                    ) {
-                        Icon(
-                            imageVector = if (isCurrentDownloaded) Icons.Default.DownloadDone else Icons.Default.Download,
-                            contentDescription = "Download",
-                            tint = when {
-                                isCurrentDownloaded -> accentColor
-                                isCurrentDownloading -> accentColor
-                                else -> mutedForegroundColor
+
+                        item {
+                            IconButton(onClick = {
+                                haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                isVideoMode = !isVideoMode
+                                applyPlaybackMode(videoMode = isVideoMode, quality = preferredVideoQuality)
+                            }) {
+                                Icon(
+                                    imageVector = Icons.Default.OndemandVideo,
+                                    contentDescription = "Video mode",
+                                    tint = if (isVideoMode) accentColor else mutedForegroundColor
+                                )
                             }
-                        )
-                    }
-
-                    IconButton(onClick = { showAddToPlaylist = true }) {
-                        Icon(
-                            imageVector = Icons.AutoMirrored.Filled.PlaylistAdd,
-                            contentDescription = "Add to Playlist",
-                            tint = mutedForegroundColor
-                        )
-                    }
-
-                    IconButton(onClick = {
-                        currentMediaItem?.let { item ->
-                            val song = SongItem(
-                                id = item.mediaId,
-                                title = item.mediaMetadata.title?.toString() ?: "Unknown",
-                                artistsText = item.mediaMetadata.artist?.toString() ?: "Unknown",
-                                thumbnailUrl = item.mediaMetadata.artworkUri?.toString()
-                            )
-                            context.startActivity(songActionsViewModel.createShareIntent(song))
                         }
-                    }) {
-                        Icon(
-                            imageVector = Icons.Default.Share,
-                            contentDescription = "Share",
-                            tint = mutedForegroundColor
-                        )
                     }
-
-                    IconButton(onClick = {
-                        isVideoMode = !isVideoMode
-                        applyPlaybackMode(videoMode = isVideoMode, quality = preferredVideoQuality)
-                    }) {
-                        Icon(
-                            imageVector = Icons.Default.OndemandVideo,
-                            contentDescription = "Video mode",
-                            tint = if (isVideoMode) accentColor else mutedForegroundColor
-                        )
-                    }
-                }
             }
         }
+    }
     }
 
 
@@ -711,9 +821,6 @@ fun PlayerScreen(
         ModalBottomSheet(
             onDismissRequest = {
                 showQueue = false
-                if (activePanel == "Queue") {
-                    activePanel = "Visual"
-                }
             },
             sheetState = sheetState
         ) {
@@ -776,6 +883,39 @@ fun PlayerScreen(
             confirmButton = {},
             dismissButton = {
                 TextButton(onClick = { showSleepTimerDialog = false }) {
+                    Text("Close")
+                }
+            }
+        )
+    }
+
+    if (showPlaybackSpeedDialog) {
+        val speedOptions = listOf(0.75f, 1.0f, 1.25f, 1.5f, 2.0f)
+        AlertDialog(
+            onDismissRequest = { showPlaybackSpeedDialog = false },
+            title = { Text("Playback Speed") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text(
+                        text = "Current speed: ${formatPlaybackSpeed(playbackSpeed)}x",
+                        style = MaterialTheme.typography.labelLarge
+                    )
+                    speedOptions.forEach { speed ->
+                        TextButton(
+                            modifier = Modifier.fillMaxWidth(),
+                            onClick = {
+                                playerConnection?.setPlaybackSpeed(speed)
+                                showPlaybackSpeedDialog = false
+                            }
+                        ) {
+                            Text(text = "${formatPlaybackSpeed(speed)}x")
+                        }
+                    }
+                }
+            },
+            confirmButton = {},
+            dismissButton = {
+                TextButton(onClick = { showPlaybackSpeedDialog = false }) {
                     Text("Close")
                 }
             }
@@ -1076,6 +1216,16 @@ private fun formatCompactCount(value: Long): String {
         value >= 1_000_000L -> String.format("%.1fM", value / 1_000_000.0)
         value >= 1_000L -> String.format("%.1fK", value / 1_000.0)
         else -> value.toString()
+    }
+}
+
+private fun formatPlaybackSpeed(speed: Float): String {
+    val rounded = ((speed * 100).toInt()) / 100f
+    val isWholeNumber = (rounded - rounded.toInt().toFloat()).absoluteValue < 0.01f
+    return if (isWholeNumber) {
+        rounded.toInt().toString()
+    } else {
+        "%.2f".format(rounded).trimEnd('0').trimEnd('.')
     }
 }
 

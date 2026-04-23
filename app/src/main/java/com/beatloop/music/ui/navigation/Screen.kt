@@ -50,6 +50,11 @@ sealed class Screen(
         selectedIcon = Icons.Filled.Settings,
         unselectedIcon = Icons.Outlined.Settings
     )
+
+    data object Changelog : Screen(
+        route = "changelog",
+        title = "Changelog"
+    )
     
     // Detail Screens
     data object Artist : Screen(

@@ -2,6 +2,7 @@ package com.beatloop.music.playback
 
 import android.app.PendingIntent
 import android.content.Intent
+import android.media.audiofx.LoudnessEnhancer
 import android.os.Bundle
 import android.util.Log
 import androidx.annotation.OptIn
@@ -38,6 +39,7 @@ import com.beatloop.music.data.model.SponsorBlockSettings
 import com.beatloop.music.data.preferences.PreferencesManager
 import com.beatloop.music.data.repository.MusicRepository
 import com.beatloop.music.data.repository.SponsorBlockRepository
+import com.beatloop.music.domain.recommendation.RecommendationContentRules
 import com.google.common.util.concurrent.Futures
 import com.google.common.util.concurrent.ListenableFuture
 import dagger.hilt.android.AndroidEntryPoint
@@ -75,6 +77,8 @@ class MusicService : MediaSessionService() {
     private var mediaSession: MediaSession? = null
     private var player: ExoPlayer? = null
     private var cache: SimpleCache? = null
+    private var loudnessEnhancer: LoudnessEnhancer? = null
+    private var normalizeAudioEnabled: Boolean = false
     
     private val serviceScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
     
@@ -101,6 +105,7 @@ class MusicService : MediaSessionService() {
         initializeCache()
         initializePlayer()
         initializeSession()
+        observePlaybackPreferences()
         restorePlaybackSnapshot()
         player?.currentMediaItem?.let { item ->
             beginPlaybackSession(item = item, previousSongId = null)
@@ -133,6 +138,50 @@ class MusicService : MediaSessionService() {
             .build()
         
         player?.addListener(playerListener)
+    }
+
+    private fun observePlaybackPreferences() {
+        serviceScope.launch {
+            preferencesManager.skipSilenceEnabled.collect { enabled ->
+                player?.skipSilenceEnabled = enabled
+            }
+        }
+
+        serviceScope.launch {
+            preferencesManager.normalizeAudioEnabled.collect { enabled ->
+                normalizeAudioEnabled = enabled
+                applyNormalizationEffect()
+            }
+        }
+    }
+
+    private fun applyNormalizationEffect() {
+        loudnessEnhancer?.runCatching {
+            enabled = false
+            release()
+        }
+        loudnessEnhancer = null
+
+        if (!normalizeAudioEnabled) {
+            return
+        }
+
+        val playerInstance = player ?: return
+        val audioSessionId = playerInstance.audioSessionId
+        if (audioSessionId == C.AUDIO_SESSION_ID_UNSET) {
+            return
+        }
+
+        runCatching {
+            LoudnessEnhancer(audioSessionId).apply {
+                setTargetGain(300)
+                enabled = true
+            }
+        }.onSuccess { enhancer ->
+            loudnessEnhancer = enhancer
+        }.onFailure { error ->
+            Log.w(TAG, "Failed to apply normalization effect", error)
+        }
     }
     
     /**
@@ -298,7 +347,11 @@ class MusicService : MediaSessionService() {
         return !url.isNullOrBlank() && (url.startsWith("https://") || url.startsWith("http://"))
     }
 
-    private fun maybeAutoFillQueue(reasonLabel: String, force: Boolean) {
+    private fun maybeAutoFillQueue(
+        reasonLabel: String,
+        bypassCooldown: Boolean = false,
+        advanceToNextAfterInsert: Boolean = false
+    ) {
         if (queueAutoFillJob?.isActive == true) return
 
         queueAutoFillJob = serviceScope.launch {
@@ -307,25 +360,35 @@ class MusicService : MediaSessionService() {
             }
 
             val playerInstance = player ?: return@launch
-            
-            // Respect repeat modes - do not auto-fill if user explicitly looping
-            if (!force && playerInstance.repeatMode != androidx.media3.common.Player.REPEAT_MODE_OFF) {
+
+            // Respect repeat modes: repeat-all loops queue, repeat-one loops current track.
+            if (playerInstance.repeatMode != Player.REPEAT_MODE_OFF) {
                 return@launch
             }
-            
-            val mediaCount = playerInstance.mediaItemCount
-            val currentIndex = playerInstance.currentMediaItemIndex.coerceAtLeast(0)
-            val remainingItems = (mediaCount - currentIndex - 1).coerceAtLeast(0)
 
-            if (!force && remainingItems > 1) {
+            val mediaCount = playerInstance.mediaItemCount
+            if (mediaCount <= 0) {
+                return@launch
+            }
+
+            val currentIndex = when (val rawIndex = playerInstance.currentMediaItemIndex) {
+                C.INDEX_UNSET -> mediaCount - 1
+                else -> rawIndex.coerceIn(0, mediaCount - 1)
+            }
+            val remainingItems = (mediaCount - currentIndex - 1)
+            val isLastItemPlaying = remainingItems <= 0
+
+            // Only auto-fill when currently on the last item in queue.
+            if (!isLastItemPlaying) {
                 return@launch
             }
 
             val seedMediaItem = playerInstance.currentMediaItem
+                ?: runCatching { playerInstance.getMediaItemAt(currentIndex) }.getOrNull()
             val seedId = seedMediaItem?.mediaId.orEmpty()
             val now = System.currentTimeMillis()
 
-            if (!force && seedId.isNotBlank() && seedId == lastAutoFillSeedId && (now - lastAutoFillAtMs) < 30_000L) {
+            if (!bypassCooldown && seedId.isNotBlank() && seedId == lastAutoFillSeedId && (now - lastAutoFillAtMs) < QUEUE_AUTOFILL_COOLDOWN_MS) {
                 return@launch
             }
 
@@ -358,7 +421,7 @@ class MusicService : MediaSessionService() {
                 )
             }
 
-            val insertionIndex = (playerInstance.currentMediaItemIndex + 1)
+            val insertionIndex = (currentIndex + 1)
                 .coerceAtLeast(0)
                 .coerceAtMost(playerInstance.mediaItemCount)
 
@@ -367,6 +430,18 @@ class MusicService : MediaSessionService() {
             lastAutoFillAtMs = System.currentTimeMillis()
 
             Log.d(TAG, "Queue auto-fill ($reasonLabel): added ${mediaItems.size} recommendation(s)")
+
+            val keepPlayWhenReady = playerInstance.playWhenReady
+            if (advanceToNextAfterInsert &&
+                playerInstance.currentMediaItemIndex == currentIndex &&
+                playerInstance.hasNextMediaItem()
+            ) {
+                playerInstance.seekToNextMediaItem()
+                if (playerInstance.playbackState == Player.STATE_IDLE) {
+                    playerInstance.prepare()
+                }
+                playerInstance.playWhenReady = keepPlayWhenReady
+            }
 
             if (playerInstance.playbackState == Player.STATE_ENDED || playerInstance.playbackState == Player.STATE_IDLE) {
                 val targetIndex = insertionIndex.coerceAtMost(playerInstance.mediaItemCount - 1).coerceAtLeast(0)
@@ -408,37 +483,128 @@ class MusicService : MediaSessionService() {
             }
         }
 
-        return collected
-            .filter { it.id.isNotBlank() && !existingIds.contains(it.id) }
-            .distinctBy { it.id }
-            .let { rawCandidates ->
-                if (rawCandidates.isEmpty()) {
-                    emptyList()
-                } else {
-                    val predicted = runCatching {
-                        musicRepository.predictNextSongs(
-                            seedSongId = seedId.takeUnless {
-                                it.isBlank() || it.startsWith("content://") || it.startsWith("file://")
-                            },
-                            candidates = rawCandidates,
-                            queueSongIds = existingIds,
-                            limit = 20
-                        )
-                    }.getOrElse { error ->
-                        Log.w(TAG, "Next-song prediction failed, using fallback ordering", error)
-                        rawCandidates.take(20)
-                    }
+        if (collected.size < 10) {
+            val fallbackSearchSongs = mutableListOf<SongItem>()
+            val seedQueries = buildQueueSeedSearchQueries(seedMediaItem)
+            for (query in seedQueries) {
+                val searchSongs = runCatching {
+                    musicRepository.search(query, SearchFilter.Songs).getOrNull()?.songs.orEmpty()
+                }.getOrDefault(emptyList())
 
-                    val finalCandidates = predicted.ifEmpty { rawCandidates }.take(20)
-                    runCatching {
-                        musicRepository.recordRecommendationImpressions(
-                            songs = finalCandidates,
-                            surface = "queue_autofill"
-                        )
-                    }
-                    finalCandidates
+                fallbackSearchSongs += searchSongs
+                if (fallbackSearchSongs.size >= 20) {
+                    break
                 }
             }
+            collected += fallbackSearchSongs
+        }
+
+        val strictCandidates = collected
+            .asSequence()
+            .filter { song ->
+                song.id.isNotBlank() &&
+                    !existingIds.contains(song.id) &&
+                    RecommendationContentRules.isTrackAllowed(song)
+            }
+            .distinctBy { song -> song.id }
+            .toList()
+
+        val rawCandidates = if (strictCandidates.isNotEmpty()) {
+            strictCandidates
+        } else {
+            val relaxedCandidates = collected
+                .asSequence()
+                .filter { song ->
+                    song.id.isNotBlank() &&
+                        !existingIds.contains(song.id)
+                }
+                .distinctBy { song -> song.id }
+                .toList()
+
+            if (relaxedCandidates.isNotEmpty()) {
+                Log.w(TAG, "Queue auto-fill using relaxed candidate rules for seedId=$seedId")
+            }
+            relaxedCandidates
+        }
+
+        if (rawCandidates.isEmpty()) {
+            Log.d(
+                TAG,
+                "Queue auto-fill candidate build produced none (seedId=$seedId, collected=${collected.size}, queueSize=${existingIds.size})"
+            )
+            return emptyList()
+        }
+
+        val strictFilteringEnabled = strictCandidates.isNotEmpty()
+        val predicted = runCatching {
+            musicRepository.predictNextSongs(
+                seedSongId = seedId.takeUnless {
+                    it.isBlank() || it.startsWith("content://") || it.startsWith("file://")
+                },
+                candidates = rawCandidates,
+                queueSongIds = existingIds,
+                limit = 12
+            )
+        }.getOrElse { error ->
+            Log.w(TAG, "Next-song prediction failed, using fallback ordering", error)
+            rawCandidates.take(12)
+        }
+
+        val rankedCandidates = predicted
+            .ifEmpty { rawCandidates }
+            .asSequence()
+            .filter { song ->
+                song.id.isNotBlank() &&
+                    !existingIds.contains(song.id) &&
+                    (!strictFilteringEnabled || RecommendationContentRules.isTrackAllowed(song))
+            }
+            .distinctBy { song -> song.id }
+            .toList()
+
+        val batchSize = when {
+            rankedCandidates.size >= QUEUE_AUTOFILL_MAX_BATCH -> QUEUE_AUTOFILL_MAX_BATCH
+            rankedCandidates.size >= QUEUE_AUTOFILL_MIN_BATCH -> QUEUE_AUTOFILL_MIN_BATCH
+            else -> 0
+        }
+
+        if (batchSize == 0) {
+            Log.d(
+                TAG,
+                "Queue auto-fill skipped due to insufficient candidates (ranked=${rankedCandidates.size}, strict=$strictFilteringEnabled, seedId=$seedId)"
+            )
+            return emptyList()
+        }
+
+        val finalCandidates = rankedCandidates.take(batchSize)
+        runCatching {
+            musicRepository.recordRecommendationImpressions(
+                songs = finalCandidates,
+                surface = "queue_autofill"
+            )
+        }
+
+        return finalCandidates
+    }
+
+    private fun buildQueueSeedSearchQueries(seedMediaItem: MediaItem?): List<String> {
+        val title = seedMediaItem?.mediaMetadata?.title?.toString().orEmpty().trim()
+        val artist = seedMediaItem?.mediaMetadata?.artist?.toString().orEmpty().trim()
+        val normalizedTitle = title
+            .replace(Regex("\\(.*?\\)"), "")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+
+        val withArtist = listOf(title, artist)
+            .filter { it.isNotBlank() }
+            .joinToString(" ")
+            .trim()
+
+        val artistFocused = if (artist.isNotBlank()) "$artist songs" else ""
+
+        return listOf(withArtist, title, normalizedTitle, artist, artistFocused, "latest songs")
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+            .distinct()
     }
     private fun initializeSession() {
         val intent = Intent(this, MainActivity::class.java)
@@ -456,6 +622,10 @@ class MusicService : MediaSessionService() {
     }
     
     private val playerListener = object : Player.Listener {
+        override fun onAudioSessionIdChanged(audioSessionId: Int) {
+            applyNormalizationEffect()
+        }
+
         override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
             val nextSongId = mediaItem?.mediaId?.takeIf { it.isNotBlank() }
             val previousSongId = finalizeActivePlaybackSession(
@@ -474,7 +644,7 @@ class MusicService : MediaSessionService() {
                 refreshPlaybackControlState()
             }
 
-            maybeAutoFillQueue(reasonLabel = "transition", force = false)
+            maybeAutoFillQueue(reasonLabel = "transition")
             persistPlaybackSnapshot()
         }
         
@@ -519,7 +689,7 @@ class MusicService : MediaSessionService() {
                             playerInstance.playWhenReady = true
                         }
                     } else {
-                        maybeAutoFillQueue(reasonLabel = "error", force = true)
+                        maybeAutoFillQueue(reasonLabel = "error")
                     }
                 }
             }
@@ -528,9 +698,32 @@ class MusicService : MediaSessionService() {
         }
 
         override fun onPlaybackStateChanged(playbackState: Int) {
-            if (playbackState == Player.STATE_ENDED) {
-                finalizeActivePlaybackSession(nextSongId = null, source = "ended")
-                maybeAutoFillQueue(reasonLabel = "ended", force = true)
+            if (playbackState == Player.STATE_ENDED || playbackState == Player.STATE_IDLE) {
+                if (playbackState == Player.STATE_ENDED) {
+                    finalizeActivePlaybackSession(nextSongId = null, source = "ended")
+                }
+
+                val playerInstance = player
+                if (playerInstance != null) {
+                    when (playerInstance.repeatMode) {
+                        Player.REPEAT_MODE_ALL -> {
+                            if (playbackState == Player.STATE_ENDED && playerInstance.mediaItemCount > 0) {
+                                playerInstance.seekToDefaultPosition(0)
+                                playerInstance.prepare()
+                                playerInstance.playWhenReady = true
+                            }
+                        }
+
+                        Player.REPEAT_MODE_ONE -> {
+                            // Explicitly preserve single-track loop behavior.
+                        }
+
+                        else -> {
+                            val reason = if (playbackState == Player.STATE_ENDED) "ended" else "idle"
+                            maybeAutoFillQueue(reasonLabel = reason)
+                        }
+                    }
+                }
             }
             persistPlaybackSnapshot()
         }
@@ -736,6 +929,7 @@ class MusicService : MediaSessionService() {
                         .add(likeCommand)
                         .add(SessionCommand(ACTION_TOGGLE_SHUFFLE, Bundle.EMPTY))
                         .add(SessionCommand(ACTION_TOGGLE_REPEAT, Bundle.EMPTY))
+                        .add(SessionCommand(ACTION_TRIGGER_QUEUE_AUTOFILL, Bundle.EMPTY))
                         .add(setSleepTimerCommand)
                         .add(clearSleepTimerCommand)
                         .build()
@@ -783,6 +977,14 @@ class MusicService : MediaSessionService() {
                 }
                 ACTION_CLEAR_SLEEP_TIMER -> {
                     clearSleepTimer()
+                }
+
+                ACTION_TRIGGER_QUEUE_AUTOFILL -> {
+                    maybeAutoFillQueue(
+                        reasonLabel = "next_at_queue_end",
+                        bypassCooldown = true,
+                        advanceToNextAfterInsert = true
+                    )
                 }
             }
             return Futures.immediateFuture(SessionResult(SessionResult.RESULT_SUCCESS))
@@ -974,6 +1176,11 @@ class MusicService : MediaSessionService() {
         finalizeActivePlaybackSession(nextSongId = null, source = "service_destroy")
         persistPlaybackSnapshot()
         playbackTrackingJob?.cancel()
+        loudnessEnhancer?.runCatching {
+            enabled = false
+            release()
+        }
+        loudnessEnhancer = null
         mediaSession?.run {
             player.release()
             release()
@@ -987,8 +1194,12 @@ class MusicService : MediaSessionService() {
     
     companion object {
         private const val TAG = "MusicService"
+        private const val QUEUE_AUTOFILL_MIN_BATCH = 2
+        private const val QUEUE_AUTOFILL_MAX_BATCH = 3
+        private const val QUEUE_AUTOFILL_COOLDOWN_MS = 30_000L
         const val ACTION_TOGGLE_SHUFFLE = "com.beatloop.music.TOGGLE_SHUFFLE"
         const val ACTION_TOGGLE_REPEAT = "com.beatloop.music.TOGGLE_REPEAT"
+        const val ACTION_TRIGGER_QUEUE_AUTOFILL = "com.beatloop.music.TRIGGER_QUEUE_AUTOFILL"
         const val ACTION_SET_SLEEP_TIMER = "com.beatloop.music.SET_SLEEP_TIMER"
         const val ACTION_CLEAR_SLEEP_TIMER = "com.beatloop.music.CLEAR_SLEEP_TIMER"
         const val EXTRA_SLEEP_TIMER_MINUTES = "extra_sleep_timer_minutes"

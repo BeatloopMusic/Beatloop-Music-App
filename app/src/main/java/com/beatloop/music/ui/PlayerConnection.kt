@@ -2,7 +2,9 @@ package com.beatloop.music.ui
 
 import android.os.Bundle
 import androidx.compose.runtime.staticCompositionLocalOf
+import androidx.media3.common.C
 import androidx.media3.common.MediaItem
+import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
 import androidx.media3.common.Timeline
 import androidx.media3.session.MediaController
@@ -44,6 +46,9 @@ class PlayerConnection(
     private val _currentQueueIndex = MutableStateFlow(0)
     val currentQueueIndex: StateFlow<Int> = _currentQueueIndex.asStateFlow()
 
+    private val _playbackSpeed = MutableStateFlow(1f)
+    val playbackSpeed: StateFlow<Float> = _playbackSpeed.asStateFlow()
+
     private val _playRequestVersion = MutableStateFlow(0)
     val playRequestVersion: StateFlow<Int> = _playRequestVersion.asStateFlow()
     
@@ -72,6 +77,10 @@ class PlayerConnection(
         override fun onTimelineChanged(timeline: Timeline, reason: Int) {
             _currentQueueIndex.value = mediaController.currentMediaItemIndex.coerceAtLeast(0)
         }
+
+        override fun onPlaybackParametersChanged(playbackParameters: PlaybackParameters) {
+            _playbackSpeed.value = playbackParameters.speed
+        }
     }
     
     init {
@@ -81,6 +90,7 @@ class PlayerConnection(
         _shuffleModeEnabled.value = mediaController.shuffleModeEnabled
         _repeatMode.value = mediaController.repeatMode
         _currentQueueIndex.value = mediaController.currentMediaItemIndex.coerceAtLeast(0)
+        _playbackSpeed.value = mediaController.playbackParameters.speed
         updateDuration()
         startPositionUpdater()
     }
@@ -109,7 +119,15 @@ class PlayerConnection(
     
     fun seekTo(position: Long) = mediaController.seekTo(position)
     
-    fun seekToNext() = mediaController.seekToNext()
+    fun seekToNext() {
+        if (shouldRequestQueueAutofillForNext()) {
+            mediaController.sendCustomCommand(
+                SessionCommand(MusicService.ACTION_TRIGGER_QUEUE_AUTOFILL, Bundle.EMPTY),
+                Bundle.EMPTY
+            )
+        }
+        mediaController.seekToNext()
+    }
     
     fun seekToPrevious() = mediaController.seekToPreviousMediaItem()
     
@@ -148,6 +166,20 @@ class PlayerConnection(
     }
 
     fun getCurrentQueueIndex(): Int = mediaController.currentMediaItemIndex.coerceAtLeast(0)
+
+    private fun shouldRequestQueueAutofillForNext(): Boolean {
+        val mediaCount = mediaController.mediaItemCount
+        if (mediaCount <= 0) return false
+        if (mediaController.repeatMode != Player.REPEAT_MODE_OFF) return false
+
+        val index = mediaController.currentMediaItemIndex
+        val safeIndex = when (index) {
+            C.INDEX_UNSET -> mediaCount - 1
+            else -> index.coerceIn(0, mediaCount - 1)
+        }
+
+        return safeIndex >= mediaCount - 1
+    }
     
     fun setMediaItem(mediaItem: MediaItem) {
         _currentMediaItem.value = mediaItem
@@ -230,6 +262,11 @@ class PlayerConnection(
             SessionCommand(MusicService.ACTION_CLEAR_SLEEP_TIMER, Bundle.EMPTY),
             Bundle.EMPTY
         )
+    }
+
+    fun setPlaybackSpeed(speed: Float) {
+        val safeSpeed = speed.coerceIn(0.5f, 2.0f)
+        mediaController.setPlaybackSpeed(safeSpeed)
     }
     
     val player: Player get() = mediaController

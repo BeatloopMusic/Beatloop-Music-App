@@ -69,6 +69,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.navigation.NavController
+import com.beatloop.music.BuildConfig
 import com.beatloop.music.data.preferences.AudioQuality
 import com.beatloop.music.data.preferences.ThemeMode
 import com.beatloop.music.domain.recommendation.RecommendationContentRules
@@ -76,6 +77,7 @@ import com.beatloop.music.ui.components.PremiumFilterChipRow
 import com.beatloop.music.ui.components.PremiumGlassSurface
 import com.beatloop.music.ui.components.PremiumScreenBackground
 import com.beatloop.music.ui.components.PremiumSectionHeader
+import com.beatloop.music.ui.navigation.Screen
 import com.beatloop.music.ui.viewmodel.SettingsViewModel
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -462,8 +464,15 @@ fun SettingsScreen(
                     SettingsGroupCard {
                         ActionSettingRow(
                             icon = Icons.Default.Info,
+                            title = "What's New",
+                            subtitle = "View changelog",
+                            onClick = { navController.navigate(Screen.Changelog.route) }
+                        )
+                        HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.18f))
+                        ActionSettingRow(
+                            icon = Icons.Default.Info,
                             title = "Version",
-                            subtitle = "1.0.0",
+                            subtitle = BuildConfig.VERSION_NAME,
                             onClick = { }
                         )
                         HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.18f))

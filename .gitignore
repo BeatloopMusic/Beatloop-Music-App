@@ -81,4 +81,5 @@ fastlane/test_output/
 
 # Gradle cache
 .gradle-cache/
+.gradle-local-cache/
 *.txt
